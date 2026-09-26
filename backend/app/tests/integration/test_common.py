@@ -52,6 +52,11 @@ def _create_equipment(db, asset="A-1") -> Equipment:
     return equipment
 
 
+def _count_rows(db) -> tuple[int, int, int]:
+    """ユーザー・備品・貸出申請の件数を返す（データが変更されていないかの確認用）"""
+    return tuple(db.scalar(select(func.count()).select_from(model)) for model in (User, Equipment, LoanRequest))
+
+
 def _create_loan(db, user, equipment, start, due, status) -> LoanRequest:
     loan = LoanRequest(
         equipment_id=equipment.id,
@@ -439,8 +444,12 @@ def test_required_fields_missing_or_wrong_type_returns_422(client, db, method, p
         db.flush()
         token = auth.create_access_token(user.id, user.token_generation, get_now())
         headers = {"Authorization": f"Bearer {token}"}
+    # 呼び出し前のデータ件数を控えておく
+    counts_before = _count_rows(db)
     response = getattr(client, method)(path, json=body, headers=headers)
     assert response.status_code == 422
+    # 拒否されたので、ユーザー・備品・貸出申請の件数が変わっていない（登録・更新されていない）
+    assert _count_rows(db) == counts_before
 
 
 @pytest.mark.parametrize(
