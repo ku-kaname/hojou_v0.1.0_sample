@@ -9,28 +9,31 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
 import { PasswordChangeRoute, RequireAdmin, RequireAuth } from './auth/RouteGuards'
 import { Layout } from './components/Layout'
+import { LoginPage } from './pages/LoginPage'
+import { HomePage } from './pages/HomePage'
+import { EquipmentListPage } from './pages/EquipmentListPage'
+import { EquipmentDetailPage } from './pages/EquipmentDetailPage'
+import { MyRequestsPage } from './pages/MyRequestsPage'
+import { PasswordChangePage } from './pages/PasswordChangePage'
 import { PlaceholderPage } from './pages/PlaceholderPage'
 
 export function App() {
   return (
     <Routes>
-      <Route path="/login" element={<PlaceholderPage title="S01 ログイン" />} />
+      <Route path="/login" element={<LoginPage />} />
 
       <Route element={<PasswordChangeRoute />}>
         <Route element={<Layout />}>
-          <Route path="/password-change" element={<PlaceholderPage title="S06 パスワード変更" />} />
+          <Route path="/password-change" element={<PasswordChangePage />} />
         </Route>
       </Route>
 
       <Route element={<RequireAuth />}>
         <Route element={<Layout />}>
-          <Route path="/" element={<PlaceholderPage title="S02 ホーム" />} />
-          <Route path="/equipments" element={<PlaceholderPage title="S03 備品一覧" />} />
-          <Route
-            path="/equipments/:equipmentId"
-            element={<PlaceholderPage title="S04 備品詳細・貸出申請" />}
-          />
-          <Route path="/my-requests" element={<PlaceholderPage title="S05 自分の申請一覧" />} />
+          <Route path="/" element={<HomePage />} />
+          <Route path="/equipments" element={<EquipmentListPage />} />
+          <Route path="/equipments/:equipmentId" element={<EquipmentDetailPage />} />
+          <Route path="/my-requests" element={<MyRequestsPage />} />
 
           <Route element={<RequireAdmin />}>
             <Route path="/admin/requests" element={<PlaceholderPage title="S07 申請管理" />} />

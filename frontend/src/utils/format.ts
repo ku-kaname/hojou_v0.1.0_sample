@@ -69,3 +69,19 @@ export function toDateInputValue(date: Date): string {
 export function loanStatusLabel(status: LoanStatus): string {
   return LOAN_STATUS_LABELS[status]
 }
+
+/** 取消できる申請状態か（申請中・承認済みのみ） */
+export function isCancelable(status: LoanStatus): boolean {
+  return status === 'requested' || status === 'approved'
+}
+
+/** 通知の移動先画面を返す（新規申請は管理者の申請管理、期限超過は管理者なら期限超過一覧、それ以外は自分の申請一覧） */
+export function notificationLink(type: NotificationType, isAdmin: boolean): string {
+  if (type === 'new_request') {
+    return '/admin/requests'
+  }
+  if (type === 'overdue' && isAdmin) {
+    return '/admin/overdue'
+  }
+  return '/my-requests'
+}

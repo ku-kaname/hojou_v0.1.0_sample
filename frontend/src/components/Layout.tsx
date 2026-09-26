@@ -12,6 +12,7 @@ import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { fetchNotificationSummary } from '../api/notifications'
 import { useAuth } from '../auth/useAuth'
 import type { NotificationSummaryResponse } from '../types/api'
+import { subscribeNotificationsChanged } from '../utils/notificationEvents'
 
 interface MenuItem {
   to: string
@@ -39,6 +40,7 @@ export function Layout() {
   const location = useLocation()
   const [summary, setSummary] = useState<NotificationSummaryResponse | null>(null)
 
+  const [refreshToken, setRefreshToken] = useState(0)
   const mustChangePassword = user?.must_change_password ?? false
 
   // 画面遷移のたびに通知サマリーを取得する（取得に失敗した場合はバッジを出さない）
@@ -64,7 +66,16 @@ export function Layout() {
     return () => {
       cancelled = true
     }
-  }, [location.pathname, mustChangePassword])
+  }, [location.pathname, mustChangePassword, refreshToken])
+
+  // 通知が既読になった場合も、未読件数を取得し直す
+  useEffect(() => {
+    function handleChanged() {
+      setRefreshToken((current) => current + 1)
+    }
+    const unsubscribe = subscribeNotificationsChanged(handleChanged)
+    return unsubscribe
+  }, [])
 
   function handleSignOut() {
     signOut()
