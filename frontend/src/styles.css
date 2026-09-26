@@ -1,0 +1,185 @@
+:root {
+  --color-bg: #f5f7fa;
+  --color-text: #1f2933;
+  --color-primary: #1d5fa8;
+  --color-header: #14385f;
+  --color-border: #cbd2d9;
+  --color-error: #b42318;
+  --color-warn: #b54708;
+  font-family: 'Hiragino Sans', 'Yu Gothic UI', 'Meiryo', sans-serif;
+  color: var(--color-text);
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+}
+
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 24px;
+  background: var(--color-header);
+  color: #fff;
+}
+
+.app-title {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.nav-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nav-list a {
+  color: #d9e2ec;
+  text-decoration: none;
+}
+
+.nav-list a.active {
+  color: #fff;
+  font-weight: bold;
+  text-decoration: underline;
+}
+
+.header-user {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+}
+
+.header-badges {
+  display: flex;
+  gap: 8px;
+}
+
+.app-main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 16px;
+}
+
+.form-field input,
+.form-field select,
+.form-field textarea {
+  padding: 6px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  font: inherit;
+}
+
+.required-mark {
+  color: var(--color-error);
+  font-size: 0.85rem;
+}
+
+.form-hint {
+  color: #616e7c;
+}
+
+.error-message {
+  padding: 8px 12px;
+  border: 1px solid var(--color-error);
+  border-radius: 4px;
+  background: #fef3f2;
+  color: var(--color-error);
+}
+
+.loading {
+  color: #616e7c;
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+}
+
+th,
+td {
+  padding: 8px;
+  border: 1px solid var(--color-border);
+  text-align: left;
+}
+
+th {
+  background: #e4e7eb;
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #e4e7eb;
+  font-size: 0.85rem;
+}
+
+.status-badges {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.badge-requested {
+  background: #fef0c7;
+}
+
+.badge-approved {
+  background: #d1e9ff;
+}
+
+.badge-lent {
+  background: #d3f8df;
+}
+
+.badge-rejected,
+.badge-canceled {
+  background: #fee4e2;
+}
+
+.badge-overdue {
+  background: var(--color-warn);
+  color: #fff;
+}
+
+.badge-notice {
+  background: #fff;
+  color: var(--color-header);
+}
+
+button {
+  padding: 6px 12px;
+  border: 1px solid var(--color-primary);
+  border-radius: 4px;
+  background: var(--color-primary);
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

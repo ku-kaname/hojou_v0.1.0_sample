@@ -1,6 +1,6 @@
 # 社内備品貸出管理システム コンテナ構成
 # 接続情報・秘密鍵は環境変数（.env。リポジトリには含めない）から取得する。.env.exampleを参照。
-# フロントエンド（Nginx）は「実装（フロントエンド共通）」で追加する。
+# frontend（Nginx）はHTTPS終端を行う。証明書（server.crt・server.key）はTLS_CERT_DIR（既定：./certs）に配置する。
 services:
   db:
     image: postgres:16
@@ -34,6 +34,18 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ${TLS_CERT_DIR:-./certs}:/etc/nginx/certs:ro
 
 volumes:
   db_data:
