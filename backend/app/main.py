@@ -9,11 +9,13 @@ FastAPIアプリケーションの組み立てと、HTTPの入口となるエン
 起動時の初期管理者作成を持つ。
 備品管理の機能群として、備品の検索・取得・登録・編集・分類一覧・予約状況・CSV一括登録のエンドポイントを持つ。
 貸出申請・承認の機能群として、貸出申請・申請取消・申請承認・申請却下・申請管理者取消・申請一覧・自分の申請取得のエンドポイントを持つ。
+貸出・返却・履歴の機能群として、貸出・返却・貸出履歴検索・貸出履歴CSV出力・期限超過一覧取得のエンドポイントを持つ。
 
 設計書：設計書/エンドポイント、設計書/サーバー処理（main）/共通/ヘルスチェック、
 設計書/サーバー処理（main）/認証・ユーザー管理/、
 設計書/サーバー処理（main）/備品管理/、
-設計書/サーバー処理（main）/貸出申請・承認/
+設計書/サーバー処理（main）/貸出申請・承認/、
+設計書/サーバー処理（main）/貸出・返却・履歴/
 """
 
 import logging
@@ -43,14 +45,19 @@ from app.schemas import (
     EquipmentResponse,
     EquipmentUpdateRequest,
     HealthResponse,
+    LoanHistoryFilter,
+    LoanHistoryQuery,
+    LoanHistoryResponse,
     LoanRequestAdminCancelRequest,
     LoanRequestCreateRequest,
     LoanRequestListQuery,
     LoanRequestRejectRequest,
     LoanRequestResponse,
+    LoanReturnRequest,
     LoginRequest,
     MeResponse,
     Page,
+    PageQuery,
     PasswordChangeRequest,
     PasswordResetRequest,
     ReservationListResponse,
@@ -1116,6 +1123,210 @@ def admin_cancel_loan_request_endpoint(
 
     # 2. 戻り値を設定
     return loan_request_response
+
+
+# ---- 貸出・返却・履歴 ----
+
+
+@api_router.get("/admin/loan-requests/overdue", response_model=Page[LoanRequestResponse])
+def list_overdue_loan_requests_endpoint(
+    query: Annotated[PageQuery, Query()],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> Page[LoanRequestResponse]:
+    """
+    期限超過一覧取得
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/期限超過一覧取得
+
+    【処理概要】
+    - 管理者が、返却予定日を過ぎても返却されていない貸出中の申請を、返却予定日の古い順で確認する。
+
+    【パラメータ】
+    - query (PageQuery) : ページング条件
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - loan_request_page (Page[LoanRequestResponse]) : ページ形式の申請一覧
+
+    【例外処理】
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. 期限超過一覧取得処理（services.list_overdue_loan_requests）
+    2. 戻り値を設定
+    """
+    # 1. 期限超過一覧取得処理
+    loan_request_page = services.list_overdue_loan_requests(db, query)
+
+    # 2. 戻り値を設定
+    return loan_request_page
+
+
+@api_router.post("/admin/loan-requests/{loan_request_id}/lend", response_model=LoanRequestResponse)
+def lend_loan_request_endpoint(
+    loan_request_id: Annotated[int, Path(ge=1)],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> LoanRequestResponse:
+    """
+    貸出処理
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/貸出処理
+
+    【処理概要】
+    - 管理者が、承認済みの申請について、備品を借用者へ渡したことを記録する（貸出中へ更新する）。
+
+    【パラメータ】
+    - loan_request_id (int) : 貸出申請内部ID（1以上）
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - loan_request_response (LoanRequestResponse) : 貸出後の申請
+
+    【例外処理】
+    - HTTPException(404) : 申請が存在しない場合
+    - HTTPException(400) : 承認済みでない、開始日前、返却予定日を過ぎている、備品が無効、貸出中の別申請がある場合
+    - HTTPException(409) : 既に貸出中の場合（同時操作）
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. 貸出実行処理（services.lend_loan_request）
+    2. 戻り値を設定
+    """
+    # 1. 貸出実行処理
+    loan_request_response = services.lend_loan_request(db, authenticated_user, loan_request_id)
+
+    # 2. 戻り値を設定
+    return loan_request_response
+
+
+@api_router.post("/admin/loan-requests/{loan_request_id}/return", response_model=LoanRequestResponse)
+def return_loan_request_endpoint(
+    loan_request_id: Annotated[int, Path(ge=1)],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+    request: LoanReturnRequest | None = None,
+) -> LoanRequestResponse:
+    """
+    返却処理
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/返却処理
+
+    【処理概要】
+    - 管理者が、貸出中の申請について、備品が返却されたことを記録する（返却済みへ更新する）。返却時の状態メモを残せる。
+
+    【パラメータ】
+    - loan_request_id (int) : 貸出申請内部ID（1以上）
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+    - request (LoanReturnRequest | None) : 返却リクエスト（ボディ省略時は返却時状態メモが空文字として扱う）
+
+    【戻り値】
+    - loan_request_response (LoanRequestResponse) : 返却後の申請
+
+    【例外処理】
+    - HTTPException(404) : 申請が存在しない場合
+    - HTTPException(400) : 貸出中でない場合
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. ボディ省略時の返却リクエストの補完
+    2. 返却実行処理（services.return_loan_request）
+    3. 戻り値を設定
+    """
+    # 1. ボディ省略時の返却リクエストの補完
+    return_request = request
+    if return_request is None:
+        return_request = LoanReturnRequest()
+
+    # 2. 返却実行処理
+    loan_request_response = services.return_loan_request(db, authenticated_user, loan_request_id, return_request)
+
+    # 3. 戻り値を設定
+    return loan_request_response
+
+
+# 固定パス`/admin/loan-history/export`は、他のパスとの衝突を避けるため一覧より先に登録する
+@api_router.get("/admin/loan-history/export")
+def export_loan_history_endpoint(
+    query: Annotated[LoanHistoryFilter, Query()],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> Response:
+    """
+    貸出履歴CSV出力
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/貸出履歴CSV出力
+
+    【処理概要】
+    - 管理者が、貸出履歴を条件で絞り込んでCSV（UTF-8・BOM付き）としてダウンロードする。ページングはしない。
+
+    【パラメータ】
+    - query (LoanHistoryFilter) : 貸出履歴条件
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - csv_response (Response) : CSVレスポンス（ダウンロード・キャッシュ禁止）
+
+    【例外処理】
+    - HTTPException(400) : 貸出日終了が貸出日開始より前の場合、出力対象が上限を超える場合
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. 貸出履歴CSV作成処理（services.export_loan_history_csv）
+    2. レスポンスを設定（メディアタイプ・ダウンロード指定・キャッシュ禁止）
+    """
+    # 1. 貸出履歴CSV作成処理
+    csv_content, filename = services.export_loan_history_csv(db, authenticated_user, query)
+
+    # 2. レスポンスを設定
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+    }
+    csv_response = Response(content=csv_content, media_type="text/csv; charset=utf-8", headers=headers)
+    return csv_response
+
+
+@api_router.get("/admin/loan-history", response_model=Page[LoanHistoryResponse])
+def search_loan_history_endpoint(
+    query: Annotated[LoanHistoryQuery, Query()],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> Page[LoanHistoryResponse]:
+    """
+    貸出履歴検索
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/貸出履歴検索
+
+    【処理概要】
+    - 管理者が、過去の貸出（貸出中・返却済み）を、期間・備品・借用者で絞り込んで確認する（貸出日時の新しい順）。
+
+    【パラメータ】
+    - query (LoanHistoryQuery) : 貸出履歴クエリ
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - loan_history_page (Page[LoanHistoryResponse]) : ページ形式の貸出履歴
+
+    【例外処理】
+    - HTTPException(400) : 貸出日終了が貸出日開始より前の場合
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. 貸出履歴検索処理（services.search_loan_history）
+    2. 戻り値を設定
+    """
+    # 1. 貸出履歴検索処理
+    loan_history_page = services.search_loan_history(db, query)
+
+    # 2. 戻り値を設定
+    return loan_history_page
 
 
 app.include_router(api_router)

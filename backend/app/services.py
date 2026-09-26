@@ -7,10 +7,12 @@
 認証・ユーザー管理の機能群として、ログイン・パスワード変更・ユーザー管理・初期管理者作成の処理を持つ。
 備品管理の機能群として、備品の検索・取得・登録・編集・分類一覧・予約状況・CSV一括登録の処理を持つ。
 貸出申請・承認の機能群として、貸出申請・申請取消・申請承認・申請却下・申請管理者取消・申請一覧・自分の申請取得の処理を持つ。
+貸出・返却・履歴の機能群として、貸出・返却・貸出履歴検索・貸出履歴CSV出力・期限超過一覧取得の処理を持つ。
 
 設計書：設計書/サーバー処理（main）/共通/、設計書/サーバー処理（main）/認証・ユーザー管理/、
 設計書/サーバー処理（main）/備品管理/、
-設計書/サーバー処理（main）/貸出申請・承認/
+設計書/サーバー処理（main）/貸出申請・承認/、
+設計書/サーバー処理（main）/貸出・返却・履歴/
 """
 
 import csv
@@ -40,14 +42,19 @@ from app.schemas import (
     EquipmentListQuery,
     EquipmentResponse,
     EquipmentUpdateRequest,
+    LoanHistoryFilter,
+    LoanHistoryQuery,
+    LoanHistoryResponse,
     LoanRequestAdminCancelRequest,
     LoanRequestCreateRequest,
     LoanRequestListQuery,
     LoanRequestRejectRequest,
     LoanRequestResponse,
+    LoanReturnRequest,
     LoginRequest,
     MeResponse,
     Page,
+    PageQuery,
     PasswordChangeRequest,
     PasswordResetRequest,
     ReservationListResponse,
@@ -84,6 +91,34 @@ _APPROVE_START_PASSED_ERROR = "開始日を過ぎた申請は承認できませ�
 _APPROVE_OVERLAP_ERROR = "承認済み・貸出中の予約と期間が重複しているため承認できません"
 _REJECT_STATUS_ERROR = "申請中の申請のみ却下できます"
 _ADMIN_CANCEL_STATUS_ERROR = "承認済みの申請のみ管理者取消できます"
+
+_LEND_STATUS_ERROR = "承認済みの申請のみ貸出処理できます"
+_LEND_BEFORE_START_ERROR = "開始日前の申請は貸出処理できません"
+_LEND_AFTER_DUE_ERROR = "返却予定日を過ぎた申請は貸出処理できません"
+_LEND_INACTIVE_EQUIPMENT_ERROR = "無効化された備品は貸出処理できません"
+_LEND_ALREADY_LENT_ERROR = "この備品は貸出中の別の申請があるため貸出処理できません（先に返却処理を行ってください）"
+_LEND_CONFLICT_ERROR = "この備品は既に貸出中です"
+_RETURN_STATUS_ERROR = "貸出中の申請のみ返却処理できます"
+_LENT_DATE_RANGE_ERROR = "貸出日終了は貸出日開始以降を指定してください"
+_LOAN_HISTORY_CSV_MAX_ROWS = 10000
+_LOAN_HISTORY_CSV_LIMIT_ERROR = "出力対象が上限（10,000件）を超えています。絞り込み条件を指定してください"
+_LOAN_HISTORY_CSV_HEADER = (
+    "申請ID",
+    "資産番号",
+    "備品名",
+    "借用者氏名",
+    "借用者所属",
+    "開始日",
+    "返却予定日",
+    "用途",
+    "状態",
+    "貸出日時",
+    "返却日時",
+    "遅延日数",
+    "返却時状態メモ",
+)
+_LOAN_STATUS_LABELS = {LoanStatus.LENT.value: "貸出中", LoanStatus.RETURNED.value: "返却済み"}
+_CSV_DANGEROUS_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 # 備品CSV一括登録の設定（列名・最小桁・最大桁。列の順序どおり）
 _ASSET_NUMBER_PATTERN = r"[A-Za-z0-9-]+"
@@ -1967,3 +2002,441 @@ def get_own_loan_request(
     # 3. 戻り値を設定
     loan_request_response = _to_loan_request_response(loan_request, equipment, requester, today)
     return loan_request_response
+
+
+# ---- 貸出・返却・履歴 ----
+
+
+def lend_loan_request(
+    db: Session,
+    authenticated_user: AuthenticatedUser,
+    loan_request_id: int,
+) -> LoanRequestResponse:
+    """
+    貸出実行処理
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/貸出処理
+
+    【処理概要】
+    - 管理者が、承認済みの申請について、備品を借用者へ渡したことを記録する（貸出中へ更新する）。
+    - 備品を行ロックしたうえで貸出申請を行ロックして最新の状態を得て、承認済み・開始日以降・返却予定日以前・備品の有効・
+      貸出中の別申請なしを検証し、貸出中へ更新する。貸出処理では通知を生成しない。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+    - loan_request_id (int) : 貸出申請内部ID
+
+    【戻り値】
+    - loan_request_response (LoanRequestResponse) : 貸出後の申請
+
+    【例外処理】
+    - HTTPException(404) : 申請が存在しない場合
+    - HTTPException(400) : 承認済みでない、開始日前、返却予定日を過ぎている、備品が無効、貸出中の別申請がある場合
+    - HTTPException(409) : 貸出中の一意制約に違反した場合（判定後の割り込み）
+
+    【処理フロー】
+    1. 現在日時・今日の日付（JST）の取得
+    2. 対象の備品を特定するための貸出申請の取得（ロックなし）
+    3. 備品の行ロック取得（ロック順は「備品 → 貸出申請」に固定する）
+    4. 貸出申請の行ロック再取得（ロック取得後の最新の状態を得る）
+    5. 貸出可能であることの検証
+    6. 同一備品に貸出中の別申請がないことの検証
+    7. 貸出申請を貸出中へ更新（一意制約違反は409）
+    8. レスポンス生成用の貸出申請詳細の取得
+    9. コミット（一意制約違反は409）
+    10. 戻り値を設定
+    """
+    # 1. 現在日時・今日の日付の取得
+    now = get_now()
+    today = get_today()
+
+    # 2. 対象の備品を特定するための貸出申請の取得（ロックなし）
+    unlocked_loan_request = crud.get_loan_request_by_id(db, loan_request_id, False)
+    if unlocked_loan_request is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_LOAN_REQUEST_NOT_FOUND_ERROR)
+
+    # 3. 備品の行ロック取得（二重貸出防止）
+    equipment = crud.get_equipment_by_id(db, unlocked_loan_request.equipment_id, True)
+
+    # 4. 貸出申請の行ロック再取得
+    loan_request = crud.get_loan_request_by_id(db, loan_request_id, True)
+    if loan_request is None or equipment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_LOAN_REQUEST_NOT_FOUND_ERROR)
+
+    # 5. 貸出可能であることの検証
+    if loan_request.status != LoanStatus.APPROVED.value:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_LEND_STATUS_ERROR)
+    if loan_request.start_date > today:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_LEND_BEFORE_START_ERROR)
+    if loan_request.due_date < today:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_LEND_AFTER_DUE_ERROR)
+    if not equipment.is_active:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_LEND_INACTIVE_EQUIPMENT_ERROR)
+
+    # 6. 同一備品に貸出中の別申請がないことの検証（期限超過中で未返却のものを含む）
+    lent_loan = crud.get_lent_loan_by_equipment(db, loan_request.equipment_id)
+    if lent_loan is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_LEND_ALREADY_LENT_ERROR)
+
+    # 7. 貸出申請を貸出中へ更新（判定後の割り込みは、DBの一意制約による最終防衛で検出する）
+    try:
+        crud.lend_loan_request(db, loan_request, authenticated_user.id, now)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_LEND_CONFLICT_ERROR) from None
+
+    # 8. レスポンス生成用の貸出申請詳細の取得
+    loan_request_response = _build_loan_request_response(db, loan_request_id, today)
+
+    # 9. コミット
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_LEND_CONFLICT_ERROR) from None
+
+    # 10. 戻り値を設定
+    return loan_request_response
+
+
+def return_loan_request(
+    db: Session,
+    authenticated_user: AuthenticatedUser,
+    loan_request_id: int,
+    request: LoanReturnRequest,
+) -> LoanRequestResponse:
+    """
+    返却実行処理
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/返却処理
+
+    【処理概要】
+    - 管理者が、貸出中の申請について、備品が返却されたことを記録する（返却済みへ更新する）。
+    - 返却は備品の占有を解放する更新のため、備品の行ロックは行わず貸出申請のみをロックする。
+    - 返却日時はサーバー時刻を記録する。返却予定日を過ぎていても通常どおり記録し、通知は生成しない。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+    - loan_request_id (int) : 貸出申請内部ID
+    - request (LoanReturnRequest) : 返却リクエスト（返却時状態メモ）
+
+    【戻り値】
+    - loan_request_response (LoanRequestResponse) : 返却後の申請
+
+    【例外処理】
+    - HTTPException(404) : 申請が存在しない場合
+    - HTTPException(400) : 貸出中でない場合（二重の返却操作は2回目が該当する）
+
+    【処理フロー】
+    1. 現在日時・今日の日付（JST）の取得
+    2. 貸出申請の行ロック取得と状態の検証
+    3. 貸出申請を返却済みへ更新
+    4. レスポンス生成用の貸出申請詳細の取得
+    5. コミット
+    6. 戻り値を設定
+    """
+    # 1. 現在日時・今日の日付の取得
+    now = get_now()
+    today = get_today()
+
+    # 2. 貸出申請の行ロック取得と状態の検証
+    loan_request = crud.get_loan_request_by_id(db, loan_request_id, True)
+    if loan_request is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_LOAN_REQUEST_NOT_FOUND_ERROR)
+    if loan_request.status != LoanStatus.LENT.value:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_RETURN_STATUS_ERROR)
+
+    # 3. 貸出申請を返却済みへ更新
+    crud.return_loan_request(db, loan_request, authenticated_user.id, request.return_note, now)
+
+    # 4. レスポンス生成用の貸出申請詳細の取得
+    loan_request_response = _build_loan_request_response(db, loan_request_id, today)
+
+    # 5. コミット
+    db.commit()
+
+    # 6. 戻り値を設定
+    return loan_request_response
+
+
+def _to_lent_datetime_range(filter_condition: LoanHistoryFilter) -> tuple[datetime | None, datetime | None]:
+    """
+    貸出日範囲変換（共通の内部処理）
+
+    貸出日の範囲（JSTの暦日）を検証し、DB検索用の日時範囲（UTC）へ変換する。
+    貸出日開始はその日のJST 0時、貸出日終了は終了日を含めるため翌日のJST 0時（「より前」で判定する）とする。
+    貸出日終了が貸出日開始より前の場合は400とする。
+    """
+    from_date = filter_condition.from_date
+    to_date = filter_condition.to_date
+    if from_date is not None and to_date is not None and to_date < from_date:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_LENT_DATE_RANGE_ERROR)
+    day_start_time = datetime.min.time()
+    lent_from = None
+    if from_date is not None:
+        from_start = datetime.combine(from_date, day_start_time, tzinfo=JST)
+        lent_from = from_start.astimezone(UTC)
+    lent_to = None
+    if to_date is not None:
+        next_day = to_date + timedelta(days=1)
+        to_end = datetime.combine(next_day, day_start_time, tzinfo=JST)
+        lent_to = to_end.astimezone(UTC)
+    return lent_from, lent_to
+
+
+def _calculate_delay_days(loan_request: LoanRequest, today: date) -> int:
+    """
+    遅延日数算出（共通の内部処理）
+
+    貸出中は「今日（JST）− 返却予定日」、返却済みは「返却日時をJSTへ変換した日付 − 返却予定日」とし、負の場合は0とする。
+    """
+    end_date = today
+    if loan_request.returned_at is not None:
+        returned_at_jst = loan_request.returned_at.astimezone(JST)
+        end_date = returned_at_jst.date()
+    delay_period = end_date - loan_request.due_date
+    delay_days = max(delay_period.days, 0)
+    return delay_days
+
+
+def _to_loan_history_response(
+    loan_request: LoanRequest,
+    equipment: Equipment,
+    requester: User,
+    today: date,
+) -> LoanHistoryResponse:
+    """
+    貸出履歴レスポンス変換（共通の内部処理）
+
+    貸出申請・備品・借用者から、貸出履歴レスポンスを作る。貸出日時は貸出履歴の条件上、必ず存在する。
+    """
+    delay_days = _calculate_delay_days(loan_request, today)
+    lent_at = loan_request.lent_at
+    if lent_at is None:
+        raise ValueError("貸出履歴に貸出日時がありません")
+    loan_history_response = LoanHistoryResponse(
+        id=loan_request.id,
+        equipment_id=equipment.id,
+        equipment_asset_number=equipment.asset_number,
+        equipment_name=equipment.name,
+        requester_id=requester.id,
+        requester_name=requester.name,
+        requester_department=requester.department,
+        start_date=loan_request.start_date,
+        due_date=loan_request.due_date,
+        purpose=loan_request.purpose,
+        status=loan_request.status,  # type: ignore[arg-type]
+        lent_at=lent_at,
+        returned_at=loan_request.returned_at,
+        return_note=loan_request.return_note,
+        delay_days=delay_days,
+    )
+    return loan_history_response
+
+
+def search_loan_history(db: Session, query: LoanHistoryQuery) -> Page[LoanHistoryResponse]:
+    """
+    貸出履歴検索処理
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/貸出履歴検索
+
+    【処理概要】
+    - 管理者が、過去の貸出（貸出中・返却済み）を、期間・備品・借用者で絞り込んで確認する（遅延日数も確認できる）。
+    - 貸出日の範囲を検証・変換し、条件に合う貸出履歴を貸出日時の新しい順でページ単位に返却する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - query (LoanHistoryQuery) : 貸出履歴クエリ
+
+    【戻り値】
+    - loan_history_page (Page[LoanHistoryResponse]) : ページ形式の貸出履歴
+
+    【例外処理】
+    - HTTPException(400) : 貸出日終了が貸出日開始より前の場合
+
+    【処理フロー】
+    1. 今日の日付（JST）の取得
+    2. 貸出日の範囲の検証と、DB検索用の日時範囲への変換
+    3. 貸出履歴の一覧・総件数の取得（存在しない備品・借用者の指定は該当なしとする）
+    4. 戻り値を設定
+    """
+    # 1. 今日の日付の取得
+    today = get_today()
+
+    # 2. 貸出日の範囲の検証と変換
+    lent_from, lent_to = _to_lent_datetime_range(query)
+
+    # 3. 貸出履歴の一覧・総件数の取得
+    items, total = crud.search_loan_history(
+        db, lent_from, lent_to, query.equipment_id, query.requester_id, query.page, query.page_size
+    )
+
+    # 4. 戻り値を設定
+    responses = [
+        _to_loan_history_response(loan_request, equipment, requester, today)
+        for loan_request, equipment, requester in items
+    ]
+    loan_history_page = Page[LoanHistoryResponse](
+        items=responses,
+        total=total,
+        page=query.page,
+        page_size=query.page_size,
+    )
+    return loan_history_page
+
+
+def _sanitize_csv_cell(value: str) -> str:
+    """
+    CSVセル無害化（共通の内部処理）
+
+    CSVインジェクション対策として、文字列のセルの先頭が`=`・`+`・`-`・`@`・タブ・復帰のいずれかの場合、
+    先頭に`'`を付与する（Excel等で数式として実行されないようにする）。それ以外はそのまま返す。
+    """
+    if value.startswith(_CSV_DANGEROUS_PREFIXES):
+        return "'" + value
+    return value
+
+
+def export_loan_history_csv(
+    db: Session,
+    authenticated_user: AuthenticatedUser,
+    filter_condition: LoanHistoryFilter,
+) -> tuple[bytes, str]:
+    """
+    貸出履歴CSV作成処理
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/貸出履歴CSV出力
+
+    【処理概要】
+    - 管理者が、貸出履歴を条件で絞り込んでCSV（UTF-8・BOM付き）として出力する。ページングはしない。
+    - 出力件数の上限（10,000件）を超える場合はエラーとする。文字列のセルはCSVインジェクション対策で無害化する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者。出力の記録に用いる）
+    - filter_condition (LoanHistoryFilter) : 貸出履歴条件
+
+    【戻り値】
+    - csv_content_and_filename (tuple[bytes, str]) : （CSVの内容（UTF-8・BOM付き）, 出力ファイル名）
+
+    【例外処理】
+    - HTTPException(400) : 貸出日終了が貸出日開始より前の場合、出力対象が上限を超える場合
+
+    【処理フロー】
+    1. 今日の日付（JST）の取得
+    2. 貸出日の範囲の検証と、DB検索用の日時範囲への変換
+    3. 出力対象の貸出履歴を上限件数＋1件まで取得し、上限超過を検証
+    4. CSVの内容の作成（見出し行と各履歴の行。文字列のセルは無害化する）
+    5. 出力ファイル名の作成（サーバーが固定の書式で作成し、リクエストの値は含めない）
+    6. 出力の実行をログへ記録（ユーザー内部ID・エンドポイント・出力件数のみ）
+    7. 戻り値を設定
+    """
+    # 1. 今日の日付の取得
+    today = get_today()
+
+    # 2. 貸出日の範囲の検証と変換
+    lent_from, lent_to = _to_lent_datetime_range(filter_condition)
+
+    # 3. 出力対象の取得と上限超過の検証（超過の検知のため1件多く取得する）
+    fetch_limit = _LOAN_HISTORY_CSV_MAX_ROWS + 1
+    rows = crud.get_loan_history_for_export(
+        db, lent_from, lent_to, filter_condition.equipment_id, filter_condition.requester_id, fetch_limit
+    )
+    row_count = len(rows)
+    if row_count > _LOAN_HISTORY_CSV_MAX_ROWS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_LOAN_HISTORY_CSV_LIMIT_ERROR)
+
+    # 4. CSVの内容の作成
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerow(_LOAN_HISTORY_CSV_HEADER)
+    for loan_request, equipment, requester in rows:
+        delay_days = _calculate_delay_days(loan_request, today)
+        lent_at = loan_request.lent_at
+        lent_at_text = ""
+        if lent_at is not None:
+            lent_at_jst = lent_at.astimezone(JST)
+            lent_at_text = lent_at_jst.strftime("%Y-%m-%d %H:%M:%S")
+        returned_at_text = ""
+        if loan_request.returned_at is not None:
+            returned_at_jst = loan_request.returned_at.astimezone(JST)
+            returned_at_text = returned_at_jst.strftime("%Y-%m-%d %H:%M:%S")
+        status_text = _LOAN_STATUS_LABELS.get(loan_request.status, loan_request.status)
+        row = [
+            loan_request.id,
+            _sanitize_csv_cell(equipment.asset_number),
+            _sanitize_csv_cell(equipment.name),
+            _sanitize_csv_cell(requester.name),
+            _sanitize_csv_cell(requester.department),
+            loan_request.start_date.isoformat(),
+            loan_request.due_date.isoformat(),
+            _sanitize_csv_cell(loan_request.purpose),
+            status_text,
+            lent_at_text,
+            returned_at_text,
+            delay_days,
+            _sanitize_csv_cell(loan_request.return_note),
+        ]
+        writer.writerow(row)
+    csv_text = "﻿" + buffer.getvalue()
+    csv_content = csv_text.encode("utf-8")
+
+    # 5. 出力ファイル名の作成
+    filename = "loan_history_" + today.strftime("%Y%m%d") + ".csv"
+
+    # 6. 出力の実行をログへ記録（個人情報・絞り込みの入力値そのものは記録しない）
+    logger.info(
+        "貸出履歴CSV出力: ユーザー内部ID=%s エンドポイント=/api/admin/loan-history/export 出力件数=%d",
+        authenticated_user.id,
+        row_count,
+    )
+
+    # 7. 戻り値を設定
+    csv_content_and_filename = (csv_content, filename)
+    return csv_content_and_filename
+
+
+def list_overdue_loan_requests(db: Session, query: PageQuery) -> Page[LoanRequestResponse]:
+    """
+    期限超過一覧取得処理
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/期限超過一覧取得
+
+    【処理概要】
+    - 管理者が、返却予定日を過ぎても返却されていない貸出中の申請を、返却予定日の古い順（遅延の大きい順）で確認する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - query (PageQuery) : ページング条件
+
+    【戻り値】
+    - loan_request_page (Page[LoanRequestResponse]) : ページ形式の申請一覧
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 今日の日付（JST）の取得
+    2. 期限超過の貸出中の申請の一覧・総件数の取得
+    3. 戻り値を設定
+    """
+    # 1. 今日の日付の取得
+    today = get_today()
+
+    # 2. 期限超過の貸出中の申請の一覧・総件数の取得
+    items, total = crud.get_overdue_loan_requests(db, today, query.page, query.page_size)
+
+    # 3. 戻り値を設定
+    responses = [
+        _to_loan_request_response(loan_request, equipment, requester, today)
+        for loan_request, equipment, requester in items
+    ]
+    loan_request_page = Page[LoanRequestResponse](
+        items=responses,
+        total=total,
+        page=query.page,
+        page_size=query.page_size,
+    )
+    return loan_request_page
