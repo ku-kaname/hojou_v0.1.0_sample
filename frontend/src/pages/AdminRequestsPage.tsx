@@ -77,6 +77,8 @@ export function AdminRequestsPage() {
     setStatus(value as LoanStatus)
     setPage(1)
     setReasonAction(null)
+    setMessage(null)
+    setActionError(null)
   }
 
   /** 確認のみで実行できる操作（承認・貸出処理）を行う */
