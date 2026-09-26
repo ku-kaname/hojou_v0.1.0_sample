@@ -15,7 +15,11 @@ import { EquipmentListPage } from './pages/EquipmentListPage'
 import { EquipmentDetailPage } from './pages/EquipmentDetailPage'
 import { MyRequestsPage } from './pages/MyRequestsPage'
 import { PasswordChangePage } from './pages/PasswordChangePage'
-import { PlaceholderPage } from './pages/PlaceholderPage'
+import { AdminRequestsPage } from './pages/AdminRequestsPage'
+import { AdminOverduePage } from './pages/AdminOverduePage'
+import { AdminEquipmentsPage } from './pages/AdminEquipmentsPage'
+import { AdminUsersPage } from './pages/AdminUsersPage'
+import { AdminHistoryPage } from './pages/AdminHistoryPage'
 
 export function App() {
   return (
@@ -36,11 +40,11 @@ export function App() {
           <Route path="/my-requests" element={<MyRequestsPage />} />
 
           <Route element={<RequireAdmin />}>
-            <Route path="/admin/requests" element={<PlaceholderPage title="S07 申請管理" />} />
-            <Route path="/admin/overdue" element={<PlaceholderPage title="S08 期限超過一覧" />} />
-            <Route path="/admin/equipments" element={<PlaceholderPage title="S09 備品管理" />} />
-            <Route path="/admin/users" element={<PlaceholderPage title="S10 ユーザー管理" />} />
-            <Route path="/admin/history" element={<PlaceholderPage title="S11 貸出履歴" />} />
+            <Route path="/admin/requests" element={<AdminRequestsPage />} />
+            <Route path="/admin/overdue" element={<AdminOverduePage />} />
+            <Route path="/admin/equipments" element={<AdminEquipmentsPage />} />
+            <Route path="/admin/users" element={<AdminUsersPage />} />
+            <Route path="/admin/history" element={<AdminHistoryPage />} />
           </Route>
         </Route>
       </Route>
