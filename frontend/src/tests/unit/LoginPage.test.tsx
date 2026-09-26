@@ -1,3 +1,15 @@
+/**
+ * 単体テスト：ログイン画面
+ *
+ * テスト仕様書：単体テスト仕様書/frontend/画面/認証・管理者画面（項番5〜7）
+ * 設計書：要件定義書/画面一覧（S01 ログイン）
+ * テスト対象ファイル：frontend/src/pages/LoginPage.tsx
+ *
+ * 【テストの考え方】
+ * サーバーには接続せず、通信（fetch）を偽物（モック）に差し替える。
+ * ログインの入力・送信を行い、表示されるメッセージや移動先の画面を確認する。
+ */
+
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
@@ -43,7 +55,7 @@ describe('ログイン画面', () => {
     vi.restoreAllMocks()
   })
 
-  it('ログイン失敗時はサーバーのメッセージを表示する', async () => {
+  it('項番5：ログインに失敗したら、サーバーのメッセージをエラーとして表示する', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       jsonResponse({ detail: 'ユーザーIDまたはパスワードが正しくありません' }, 401),
     )
@@ -56,7 +68,7 @@ describe('ログイン画面', () => {
     )
   })
 
-  it('ログイン成功時はホーム画面へ移動する', async () => {
+  it('項番6：ログインに成功したらホーム画面へ移動する', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = String(input)
       if (url.includes('/auth/login')) {
@@ -77,7 +89,7 @@ describe('ログイン画面', () => {
     await waitFor(() => expect(screen.getByText('ホーム画面')).toBeInTheDocument())
   })
 
-  it('初期パスワード変更が必要ならパスワード変更画面へ移動する', async () => {
+  it('項番7：初期パスワード変更が必要なユーザーは、パスワード変更画面へ移動する', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
       const url = String(input)
       if (url.includes('/auth/login')) {
