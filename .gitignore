@@ -23,3 +23,6 @@ coverage/
 *.log
 .DS_Store
 Thumbs.db
+
+# TLS証明書・秘密鍵（リポジトリに含めない）
+certs/
