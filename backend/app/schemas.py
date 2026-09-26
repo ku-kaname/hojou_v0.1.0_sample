@@ -9,7 +9,7 @@
 設計書：設計書/スキーマ（schemas）/共通
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Generic, TypeVar
 from zoneinfo import ZoneInfo
 
@@ -24,7 +24,7 @@ def _to_jst_iso(value: datetime) -> str:
     """UTC等の日時をJST（+09:00）のISO 8601文字列へ変換する（タイムゾーン無しはUTCとみなす）"""
     aware_value = value
     if aware_value.tzinfo is None:
-        aware_value = aware_value.replace(tzinfo=ZoneInfo("UTC"))
+        aware_value = aware_value.replace(tzinfo=UTC)
     jst_value = aware_value.astimezone(JST)
     return jst_value.isoformat()
 

@@ -8,6 +8,7 @@
 設計書：設計書/認証・認可（auth）/
 """
 
+import logging
 import os
 from datetime import datetime, timedelta
 from typing import Annotated
@@ -23,6 +24,8 @@ from app import crud
 from app.database import get_db
 from app.models import Role
 from app.schemas import AuthenticatedUser
+
+logger = logging.getLogger("app.auth")
 
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 8
@@ -198,6 +201,11 @@ def _build_credentials_error() -> HTTPException:
     )
 
 
+def _log_auth_failure(user_id: int | None, result: str) -> None:
+    """認証・認可の失敗をサーバーログに記録する（ユーザー内部ID・結果のみ。トークン・入力値は記録しない）"""
+    logger.warning("認証・認可エラー: ユーザー内部ID=%s 結果=%s", user_id, result)
+
+
 def get_current_user(
     token: Annotated[str | None, Depends(_oauth2_scheme)],
     db: Annotated[Session, Depends(get_db)],
@@ -230,6 +238,7 @@ def get_current_user(
     """
     # 1. Bearerトークンの検証（未指定も他の認証失敗と同一の401とする）
     if token is None:
+        _log_auth_failure(None, "トークン未指定")
         raise _build_credentials_error()
     secret_key = _get_jwt_secret_key()
     try:
@@ -240,21 +249,31 @@ def get_current_user(
             options={"require": ["sub", "gen", "exp"]},
         )
     except jwt.PyJWTError:
+        _log_auth_failure(None, "トークン不正または期限切れ")
         raise _build_credentials_error() from None
     try:
         user_id = int(payload["sub"])
         token_generation = payload["gen"]
     except (KeyError, TypeError, ValueError):
+        _log_auth_failure(None, "クレーム不正")
         raise _build_credentials_error() from None
     # bool（True/False）は整数として扱わない
     if not isinstance(token_generation, int) or isinstance(token_generation, bool):
+        _log_auth_failure(user_id, "クレーム不正")
         raise _build_credentials_error()
 
     # 2. 登録ユーザー取得
     user = crud.get_user_by_id(db, user_id)
 
     # 3. ユーザー状態の検証
-    if user is None or not user.is_active or user.token_generation != token_generation:
+    if user is None:
+        _log_auth_failure(user_id, "ユーザー未登録")
+        raise _build_credentials_error()
+    if not user.is_active:
+        _log_auth_failure(user_id, "ユーザー無効")
+        raise _build_credentials_error()
+    if user.token_generation != token_generation:
+        _log_auth_failure(user_id, "トークン世代不一致")
         raise _build_credentials_error()
 
     # 4. 戻り値を設定
@@ -287,6 +306,7 @@ def get_current_active_user(
     2. 戻り値を設定
     """
     if authenticated_user.must_change_password:
+        _log_auth_failure(authenticated_user.id, "初期パスワード未変更")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="初期パスワードの変更が必要です")
     return authenticated_user
 
@@ -316,5 +336,6 @@ def get_current_admin_user(
     2. 戻り値を設定
     """
     if authenticated_user.role != Role.ADMIN.value:
+        _log_auth_failure(authenticated_user.id, "管理者権限なし")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="この操作を行う権限がありません")
     return authenticated_user

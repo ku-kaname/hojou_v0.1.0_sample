@@ -49,7 +49,8 @@ def get_session_factory() -> sessionmaker[Session]:
     【戻り値】
     - session_factory (sessionmaker[Session]) : セッションファクトリー
     """
-    return sessionmaker(bind=get_engine(), expire_on_commit=False)
+    engine = get_engine()
+    return sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def get_db() -> Iterator[Session]:

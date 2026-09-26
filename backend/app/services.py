@@ -39,7 +39,8 @@ def get_now() -> datetime:
     1. サーバー時刻をUTCのタイムゾーン付きで取得
     2. 戻り値を設定
     """
-    return datetime.now(UTC)
+    now = datetime.now(UTC)
+    return now
 
 
 def get_today() -> date:
@@ -104,6 +105,7 @@ def create_notifications(
     2. 戻り値を設定（なし）
     """
     # 1. 通知の生成（重複除外は、先に現れた宛先の順序を保つ）
-    unique_recipient_ids = list(dict.fromkeys(recipient_ids))
+    ordered_recipients = dict.fromkeys(recipient_ids)
+    unique_recipient_ids = list(ordered_recipients)
     for recipient_id in unique_recipient_ids:
         crud.create_notification(db, recipient_id, notification_type, loan_request_id, notified_date)

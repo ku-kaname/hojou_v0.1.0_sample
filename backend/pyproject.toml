@@ -30,6 +30,8 @@ packages = ["app"]
 
 [tool.ruff]
 line-length = 120
+# 自動生成のマイグレーションは整形・規約の対象外とする
+extend-exclude = ["migrations/versions"]
 target-version = "py312"
 
 [tool.ruff.lint]

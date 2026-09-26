@@ -12,7 +12,7 @@ import pytest
 from fastapi import Depends
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app import auth, crud, services
 from app.database import get_db
@@ -196,3 +196,35 @@ def test_expired_and_forged_tokens_return_401(client, db):
     for token in (expired_token, forged_token, "not.a.jwt"):
         response = client.get("/api/_test_protected", headers={"Authorization": f"Bearer {token}"})
         assert response.status_code == 401
+
+
+def test_health_check_returns_503_when_db_unavailable(client, db, monkeypatch):
+    def raise_connection_error(*args, **kwargs):
+        raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+
+    monkeypatch.setattr(db, "execute", raise_connection_error)
+    response = client.get("/api/health")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "サービスを利用できません"}
+
+
+def test_unexpected_error_returns_500_without_details(db):
+    def raise_unexpected_error():
+        raise ValueError("secret internal detail")
+
+    app.dependency_overrides[get_db] = lambda: db
+    app.add_api_route("/api/_test_error", raise_unexpected_error)
+    try:
+        response = TestClient(app, raise_server_exceptions=False).get("/api/_test_error")
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code == 500
+    assert response.json() == {"detail": "サーバーエラーが発生しました"}
+    assert "secret" not in response.text
+
+
+def test_auth_failure_is_logged_without_token(client, caplog):
+    with caplog.at_level("WARNING"):
+        client.get("/api/_test_protected", headers={"Authorization": "Bearer secret-token-value"})
+    assert "認証・認可エラー" in caplog.text
+    assert "secret-token-value" not in caplog.text
