@@ -8,10 +8,12 @@ FastAPIアプリケーションの組み立てと、HTTPの入口となるエン
 認証・ユーザー管理の機能群として、ログイン・ログアウト・パスワード変更・ユーザー管理のエンドポイントと、
 起動時の初期管理者作成を持つ。
 備品管理の機能群として、備品の検索・取得・登録・編集・分類一覧・予約状況・CSV一括登録のエンドポイントを持つ。
+貸出申請・承認の機能群として、貸出申請・申請取消・申請承認・申請却下・申請管理者取消・申請一覧・自分の申請取得のエンドポイントを持つ。
 
 設計書：設計書/エンドポイント、設計書/サーバー処理（main）/共通/ヘルスチェック、
 設計書/サーバー処理（main）/認証・ユーザー管理/、
-設計書/サーバー処理（main）/備品管理/
+設計書/サーバー処理（main）/備品管理/、
+設計書/サーバー処理（main）/貸出申請・承認/
 """
 
 import logging
@@ -41,6 +43,11 @@ from app.schemas import (
     EquipmentResponse,
     EquipmentUpdateRequest,
     HealthResponse,
+    LoanRequestAdminCancelRequest,
+    LoanRequestCreateRequest,
+    LoanRequestListQuery,
+    LoanRequestRejectRequest,
+    LoanRequestResponse,
     LoginRequest,
     MeResponse,
     Page,
@@ -800,6 +807,315 @@ def update_equipment_endpoint(
 
     # 2. 戻り値を設定
     return equipment_response
+
+
+# ---- 貸出申請・承認 ----
+
+
+@api_router.post("/loan-requests", response_model=LoanRequestResponse, status_code=status.HTTP_201_CREATED)
+def apply_loan_request_endpoint(
+    request: LoanRequestCreateRequest,
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_active_user)],
+) -> LoanRequestResponse:
+    """
+    貸出申請
+
+    設計書：設計書/サーバー処理（main）/貸出申請・承認/貸出申請
+
+    【処理概要】
+    - 認証済みユーザーが、備品と貸出期間・用途を指定して貸出を申請する。将来日の予約を含む。
+
+    【パラメータ】
+    - request (LoanRequestCreateRequest) : 貸出申請リクエスト
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効ユーザー。初期パスワード変更済み）
+
+    【戻り値】
+    - loan_request_response (LoanRequestResponse) : 登録した申請（201）
+
+    【例外処理】
+    - HTTPException(400) : 開始日が今日より前、または返却予定日が開始日より前の場合
+    - HTTPException(404) : 備品が存在しない、または無効化済みの場合
+    - HTTPException(409) : 承認済み・貸出中の予約と期間が重複する場合
+    - HTTPException(401・403) : 認証エラー
+
+    【処理フロー】
+    1. 貸出申請処理（services.apply_loan_request）
+    2. 戻り値を設定
+    """
+    # 1. 貸出申請処理
+    loan_request_response = services.apply_loan_request(db, authenticated_user, request)
+
+    # 2. 戻り値を設定
+    return loan_request_response
+
+
+# 固定パス`/loan-requests/me`は、パスパラメーター付きのパスより先に登録する
+@api_router.get("/loan-requests/me", response_model=Page[LoanRequestResponse])
+def list_my_loan_requests_endpoint(
+    query: Annotated[LoanRequestListQuery, Query()],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_active_user)],
+) -> Page[LoanRequestResponse]:
+    """
+    自分の申請一覧取得
+
+    設計書：設計書/サーバー処理（main）/貸出申請・承認/自分の申請一覧取得
+
+    【処理概要】
+    - 認証済みユーザーが、自分の申請の状態と履歴を一覧で確認する（新しい順）。
+
+    【パラメータ】
+    - query (LoanRequestListQuery) : 貸出申請一覧クエリ
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効ユーザー。初期パスワード変更済み）
+
+    【戻り値】
+    - page_response (Page[LoanRequestResponse]) : ページ形式の申請一覧
+
+    【例外処理】
+    - HTTPException(401・403) : 認証エラー
+
+    【処理フロー】
+    1. 自分の申請一覧取得処理（services.list_my_loan_requests）
+    2. 戻り値を設定
+    """
+    # 1. 自分の申請一覧取得処理
+    page_response = services.list_my_loan_requests(db, authenticated_user, query)
+
+    # 2. 戻り値を設定
+    return page_response
+
+
+@api_router.get("/loan-requests/me/{loan_request_id}", response_model=LoanRequestResponse)
+def get_my_loan_request_endpoint(
+    loan_request_id: Annotated[int, Path(ge=1)],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_active_user)],
+) -> LoanRequestResponse:
+    """
+    自分の申請取得
+
+    設計書：設計書/サーバー処理（main）/貸出申請・承認/自分の申請取得
+
+    【処理概要】
+    - 認証済みユーザーが、自分の申請を1件確認する。他人の申請は存在しないものとして扱う。
+
+    【パラメータ】
+    - loan_request_id (int) : 貸出申請内部ID（1以上）
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効ユーザー。初期パスワード変更済み）
+
+    【戻り値】
+    - loan_request_response (LoanRequestResponse) : 申請
+
+    【例外処理】
+    - HTTPException(404) : 申請が存在しない、または他人の申請の場合
+    - HTTPException(401・403) : 認証エラー
+
+    【処理フロー】
+    1. 自分の申請取得処理（services.get_own_loan_request）
+    2. 戻り値を設定
+    """
+    # 1. 自分の申請取得処理
+    loan_request_response = services.get_own_loan_request(db, authenticated_user, loan_request_id)
+
+    # 2. 戻り値を設定
+    return loan_request_response
+
+
+@api_router.post("/loan-requests/{loan_request_id}/cancel", response_model=LoanRequestResponse)
+def cancel_my_loan_request_endpoint(
+    loan_request_id: Annotated[int, Path(ge=1)],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_active_user)],
+) -> LoanRequestResponse:
+    """
+    申請取消
+
+    設計書：設計書/サーバー処理（main）/貸出申請・承認/申請取消
+
+    【処理概要】
+    - 認証済みユーザーが、自分の「申請中」または「承認済み」の申請を、貸出前に取り消す。
+
+    【パラメータ】
+    - loan_request_id (int) : 貸出申請内部ID（1以上）
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効ユーザー。初期パスワード変更済み）
+
+    【戻り値】
+    - loan_request_response (LoanRequestResponse) : 取消後の申請
+
+    【例外処理】
+    - HTTPException(404) : 申請が存在しない、または他人の申請の場合
+    - HTTPException(400) : 申請中・承認済み以外の状態の場合
+    - HTTPException(401・403) : 認証エラー
+
+    【処理フロー】
+    1. 申請取消処理（services.cancel_own_loan_request）
+    2. 戻り値を設定
+    """
+    # 1. 申請取消処理
+    loan_request_response = services.cancel_own_loan_request(db, authenticated_user, loan_request_id)
+
+    # 2. 戻り値を設定
+    return loan_request_response
+
+
+@api_router.get("/admin/loan-requests", response_model=Page[LoanRequestResponse])
+def list_admin_loan_requests_endpoint(
+    query: Annotated[LoanRequestListQuery, Query()],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> Page[LoanRequestResponse]:
+    """
+    承認待ち申請一覧取得
+
+    設計書：設計書/サーバー処理（main）/貸出申請・承認/承認待ち申請一覧取得
+
+    【処理概要】
+    - 管理者が、承認待ち（既定）を中心に、全申請を状態で絞り込んで確認する（古い順）。
+
+    【パラメータ】
+    - query (LoanRequestListQuery) : 貸出申請一覧クエリ
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - page_response (Page[LoanRequestResponse]) : ページ形式の申請一覧
+
+    【例外処理】
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. 承認待ち申請一覧取得処理（services.list_loan_requests_admin）
+    2. 戻り値を設定
+    """
+    # 1. 承認待ち申請一覧取得処理
+    page_response = services.list_loan_requests_admin(db, query)
+
+    # 2. 戻り値を設定
+    return page_response
+
+
+@api_router.post("/admin/loan-requests/{loan_request_id}/approve", response_model=LoanRequestResponse)
+def approve_loan_request_endpoint(
+    loan_request_id: Annotated[int, Path(ge=1)],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> LoanRequestResponse:
+    """
+    申請承認
+
+    設計書：設計書/サーバー処理（main）/貸出申請・承認/申請承認
+
+    【処理概要】
+    - 管理者が、申請中の申請を承認する。承認時に期間の重複を再検証する（二重貸出の防止）。
+
+    【パラメータ】
+    - loan_request_id (int) : 貸出申請内部ID（1以上）
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - loan_request_response (LoanRequestResponse) : 承認後の申請
+
+    【例外処理】
+    - HTTPException(404) : 申請が存在しない場合
+    - HTTPException(400) : 申請中でない、または開始日を過ぎている場合
+    - HTTPException(409) : 承認済み・貸出中の予約と期間が重複する場合
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. 申請承認処理（services.approve_loan_request）
+    2. 戻り値を設定
+    """
+    # 1. 申請承認処理
+    loan_request_response = services.approve_loan_request(db, authenticated_user, loan_request_id)
+
+    # 2. 戻り値を設定
+    return loan_request_response
+
+
+@api_router.post("/admin/loan-requests/{loan_request_id}/reject", response_model=LoanRequestResponse)
+def reject_loan_request_endpoint(
+    loan_request_id: Annotated[int, Path(ge=1)],
+    request: LoanRequestRejectRequest,
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> LoanRequestResponse:
+    """
+    申請却下
+
+    設計書：設計書/サーバー処理（main）/貸出申請・承認/申請却下
+
+    【処理概要】
+    - 管理者が、申請中の申請を、理由を付けて却下する。
+
+    【パラメータ】
+    - loan_request_id (int) : 貸出申請内部ID（1以上）
+    - request (LoanRequestRejectRequest) : 申請却下リクエスト
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - loan_request_response (LoanRequestResponse) : 却下後の申請
+
+    【例外処理】
+    - HTTPException(404) : 申請が存在しない場合
+    - HTTPException(400) : 申請中でない場合
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. 申請却下処理（services.reject_loan_request）
+    2. 戻り値を設定
+    """
+    # 1. 申請却下処理
+    loan_request_response = services.reject_loan_request(db, authenticated_user, loan_request_id, request)
+
+    # 2. 戻り値を設定
+    return loan_request_response
+
+
+@api_router.post("/admin/loan-requests/{loan_request_id}/admin-cancel", response_model=LoanRequestResponse)
+def admin_cancel_loan_request_endpoint(
+    loan_request_id: Annotated[int, Path(ge=1)],
+    request: LoanRequestAdminCancelRequest,
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> LoanRequestResponse:
+    """
+    申請管理者取消
+
+    設計書：設計書/サーバー処理（main）/貸出申請・承認/申請管理者取消
+
+    【処理概要】
+    - 管理者が、承認済みの申請を、理由を付けて取り消す（備品故障等）。
+
+    【パラメータ】
+    - loan_request_id (int) : 貸出申請内部ID（1以上）
+    - request (LoanRequestAdminCancelRequest) : 申請管理者取消リクエスト
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - loan_request_response (LoanRequestResponse) : 取消後の申請
+
+    【例外処理】
+    - HTTPException(404) : 申請が存在しない場合
+    - HTTPException(400) : 承認済みでない場合
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. 申請管理者取消処理（services.admin_cancel_loan_request）
+    2. 戻り値を設定
+    """
+    # 1. 申請管理者取消処理
+    loan_request_response = services.admin_cancel_loan_request(db, authenticated_user, loan_request_id, request)
+
+    # 2. 戻り値を設定
+    return loan_request_response
 
 
 app.include_router(api_router)
