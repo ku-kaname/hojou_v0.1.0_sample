@@ -10,10 +10,11 @@
 備品管理の機能群で使うリクエスト・レスポンス（備品登録・編集・一覧・予約状況・CSV一括登録等）も同様に定義する。
 貸出申請・承認の機能群で使うリクエスト・レスポンス（貸出申請・却下・管理者取消・申請一覧・申請レスポンス）も同様に定義する。
 貸出・返却・履歴の機能群で使うリクエスト・レスポンス（返却・貸出履歴条件・貸出履歴レスポンス）も同様に定義する。
+通知・日次処理の機能群で使うリクエスト・レスポンス（通知一覧条件・通知・通知サマリー・通知全件既読）も同様に定義する。
 
 設計書：設計書/スキーマ（schemas）/共通、設計書/スキーマ（schemas）/認証・ユーザー管理、設計書/スキーマ（schemas）/備品管理、
 設計書/スキーマ（schemas）/貸出申請・承認、
-設計書/スキーマ（schemas）/貸出・返却・履歴
+設計書/スキーマ（schemas）/貸出・返却・履歴（通知関連を含む）
 """
 
 from datetime import UTC, date, datetime
@@ -384,3 +385,44 @@ class LoanHistoryResponse(BaseModel):
     returned_at: JstDatetime | None = Field(description="返却日時（貸出中はnull）")
     return_note: str = Field(description="返却時状態メモ（返却前は空文字）")
     delay_days: int = Field(ge=0, description="遅延日数（遅れていなければ0）")
+
+
+# ---------------------------------------------------------------------------
+# 通知・日次処理の機能群
+# ---------------------------------------------------------------------------
+
+NotificationTypeValue = Literal["approved", "rejected", "canceled", "new_request", "due_soon", "overdue"]
+
+
+class NotificationListQuery(PageQuery):
+    """通知一覧クエリ。ページング条件に既読フラグでの絞り込みを加えたもの"""
+
+    is_read: bool | None = Field(default=None, description="既読フラグ（省略時は既読・未読の両方）")
+
+
+class NotificationResponse(BaseModel):
+    """通知レスポンス。関連する貸出申請の備品情報を含む。宛先の内部IDは含めない"""
+
+    id: int = Field(ge=1, description="通知内部ID")
+    type: NotificationTypeValue = Field(description="種別")
+    loan_request_id: int = Field(ge=1, description="関連する貸出申請内部ID")
+    equipment_asset_number: str = Field(description="備品資産番号")
+    equipment_name: str = Field(description="備品名")
+    is_read: bool = Field(description="既読フラグ")
+    created_at: JstDatetime = Field(description="作成日時（JST）")
+    notified_date: date = Field(description="通知日（JST）")
+
+
+class NotificationSummaryResponse(BaseModel):
+    """通知サマリーレスポンス。画面上部のバッジ表示用の件数"""
+
+    unread_count: int = Field(ge=0, description="未読通知件数")
+    pending_request_count: int | None = Field(
+        default=None, ge=0, description="承認待ち申請件数（管理者のみ。一般ユーザーはnull）"
+    )
+
+
+class NotificationReadAllResponse(BaseModel):
+    """通知全件既読化レスポンス"""
+
+    updated_count: int = Field(ge=0, description="既読へ更新した件数")
