@@ -8,8 +8,10 @@
 認証・ユーザー管理の機能群で使うリクエスト・レスポンス（ログイン・パスワード変更・ユーザー登録・編集等）も、
 本ファイルの後半にまとめて定義する。
 備品管理の機能群で使うリクエスト・レスポンス（備品登録・編集・一覧・予約状況・CSV一括登録等）も同様に定義する。
+貸出申請・承認の機能群で使うリクエスト・レスポンス（貸出申請・却下・管理者取消・申請一覧・申請レスポンス）も同様に定義する。
 
-設計書：設計書/スキーマ（schemas）/共通、設計書/スキーマ（schemas）/認証・ユーザー管理、設計書/スキーマ（schemas）/備品管理
+設計書：設計書/スキーマ（schemas）/共通、設計書/スキーマ（schemas）/認証・ユーザー管理、設計書/スキーマ（schemas）/備品管理、
+設計書/スキーマ（schemas）/貸出申請・承認
 """
 
 from datetime import UTC, date, datetime
@@ -273,3 +275,64 @@ class CsvImportErrorResponse(ErrorResponse):
     """CSVエラーレスポンス（ステータスコード400）"""
 
     errors: list[CsvRowError] = Field(description="行別エラー一覧（最大100件。行番号の昇順）")
+
+
+# ---- 貸出申請・承認 ----
+
+# 申請状態（設計書「テーブル定義（models）」の列挙値）
+LoanStatusValue = Literal["requested", "approved", "lent", "returned", "rejected", "canceled"]
+
+PurposeValue = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+ReasonValue = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+
+
+class LoanRequestCreateRequest(BaseModel):
+    """貸出申請リクエスト。申請者は認証済みユーザーとし、リクエストで指定させない"""
+
+    equipment_id: int = Field(ge=1, description="備品内部ID")
+    start_date: date = Field(description="開始日（今日以降であることは業務ルールで検証する）")
+    due_date: date = Field(description="返却予定日（開始日以降であることは業務ルールで検証する）")
+    purpose: PurposeValue = Field(description="用途（前後の空白は除去）")
+
+
+class LoanRequestRejectRequest(BaseModel):
+    """申請却下リクエスト"""
+
+    reason: ReasonValue = Field(description="理由（前後の空白を除去。空白のみは不可）")
+
+
+class LoanRequestAdminCancelRequest(BaseModel):
+    """申請管理者取消リクエスト"""
+
+    reason: ReasonValue = Field(description="理由（前後の空白を除去。空白のみは不可）")
+
+
+class LoanRequestListQuery(PageQuery):
+    """貸出申請一覧クエリ"""
+
+    status: LoanStatusValue | None = Field(default=None, description="状態（省略時の扱いは各エンドポイントに従う）")
+
+
+class LoanRequestResponse(BaseModel):
+    """申請レスポンス。期限超過・期限超過日数は状態ではなく算出値。操作した管理者の内部IDは含めない"""
+
+    id: int = Field(ge=1, description="内部ID")
+    equipment_id: int = Field(ge=1, description="備品内部ID")
+    equipment_asset_number: str = Field(description="備品資産番号")
+    equipment_name: str = Field(description="備品名")
+    requester_id: int = Field(ge=1, description="申請者内部ID")
+    requester_name: str = Field(description="申請者氏名")
+    requester_department: str = Field(description="申請者所属")
+    start_date: date = Field(description="開始日")
+    due_date: date = Field(description="返却予定日")
+    purpose: str = Field(description="用途")
+    status: LoanStatusValue = Field(description="状態")
+    reason: str = Field(description="理由（却下・取消。ない場合は空文字）")
+    return_note: str = Field(description="返却時状態メモ（返却前は空文字）")
+    requested_at: JstDatetime = Field(description="申請日時（JST）")
+    decided_at: JstDatetime | None = Field(description="承認却下日時（未処理はnull）")
+    lent_at: JstDatetime | None = Field(description="貸出日時（未貸出はnull）")
+    returned_at: JstDatetime | None = Field(description="返却日時（未返却はnull）")
+    canceled_at: JstDatetime | None = Field(description="取消日時（未取消はnull）")
+    is_overdue: bool = Field(description="期限超過（貸出中かつ返却予定日が今日より前）")
+    overdue_days: int = Field(ge=0, description="期限超過日数（超過でなければ0）")
