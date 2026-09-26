@@ -9,13 +9,11 @@
 """
 
 from datetime import UTC, date, datetime
-from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
 from app import crud
-
-JST = ZoneInfo("Asia/Tokyo")
+from app.schemas import JST
 
 
 def get_now() -> datetime:

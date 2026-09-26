@@ -157,6 +157,7 @@ def test_health_check_ok(client):
 def test_missing_token_returns_401(client):
     response = client.get("/api/_test_protected")
     assert response.status_code == 401
+    assert response.json() == {"detail": "資格情報を検証できませんでした"}
     assert response.headers["www-authenticate"] == "Bearer"
 
 

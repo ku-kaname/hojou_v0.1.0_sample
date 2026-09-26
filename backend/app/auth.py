@@ -35,7 +35,9 @@ _password_hasher = PasswordHash((Argon2Hasher(),))
 # 処理時間の差からユーザーの有無を推測されないようにするために使う
 _DUMMY_PASSWORD_HASH = _password_hasher.hash("dummy-password-for-timing-equalization")
 
-_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+# auto_error=False：トークン未指定時の応答を、標準の英語メッセージではなく
+# 他の認証失敗と同一の日本語メッセージにそろえるため
+_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
 _CREDENTIALS_ERROR_MESSAGE = "資格情報を検証できませんでした"
 
@@ -197,7 +199,7 @@ def _build_credentials_error() -> HTTPException:
 
 
 def get_current_user(
-    token: Annotated[str, Depends(_oauth2_scheme)],
+    token: Annotated[str | None, Depends(_oauth2_scheme)],
     db: Annotated[Session, Depends(get_db)],
 ) -> AuthenticatedUser:
     """
@@ -210,7 +212,7 @@ def get_current_user(
     - 初期パスワード未変更のユーザーでも通す（ログアウト・パスワード変更・自分の情報取得用）。
 
     【パラメータ】
-    - token (str) : リクエストヘッダーのBearerトークン（未指定は401）
+    - token (str | None) : リクエストヘッダーのBearerトークン（未指定は401）
     - db (Session) : DBセッション
 
     【戻り値】
@@ -226,7 +228,9 @@ def get_current_user(
     3. ユーザー状態の検証（有効フラグ・トークン世代）
     4. 戻り値を設定
     """
-    # 1. Bearerトークンの検証
+    # 1. Bearerトークンの検証（未指定も他の認証失敗と同一の401とする）
+    if token is None:
+        raise _build_credentials_error()
     secret_key = _get_jwt_secret_key()
     try:
         payload = jwt.decode(
