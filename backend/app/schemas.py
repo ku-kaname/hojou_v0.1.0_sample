@@ -9,9 +9,11 @@
 本ファイルの後半にまとめて定義する。
 備品管理の機能群で使うリクエスト・レスポンス（備品登録・編集・一覧・予約状況・CSV一括登録等）も同様に定義する。
 貸出申請・承認の機能群で使うリクエスト・レスポンス（貸出申請・却下・管理者取消・申請一覧・申請レスポンス）も同様に定義する。
+貸出・返却・履歴の機能群で使うリクエスト・レスポンス（返却・貸出履歴条件・貸出履歴レスポンス）も同様に定義する。
 
 設計書：設計書/スキーマ（schemas）/共通、設計書/スキーマ（schemas）/認証・ユーザー管理、設計書/スキーマ（schemas）/備品管理、
-設計書/スキーマ（schemas）/貸出申請・承認
+設計書/スキーマ（schemas）/貸出申請・承認、
+設計書/スキーマ（schemas）/貸出・返却・履歴
 """
 
 from datetime import UTC, date, datetime
@@ -336,3 +338,49 @@ class LoanRequestResponse(BaseModel):
     canceled_at: JstDatetime | None = Field(description="取消日時（未取消はnull）")
     is_overdue: bool = Field(description="期限超過（貸出中かつ返却予定日が今日より前）")
     overdue_days: int = Field(ge=0, description="期限超過日数（超過でなければ0）")
+
+
+# ---- 貸出・返却・履歴 ----
+
+ReturnNoteValue = Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)]
+
+
+class LoanReturnRequest(BaseModel):
+    """返却リクエスト。返却日時はクライアントから受け取らず、サーバー時刻を記録する"""
+
+    return_note: ReturnNoteValue = Field(default="", description="返却時状態メモ（前後の空白は除去。省略時は空文字）")
+
+
+class LoanHistoryFilter(BaseModel):
+    """貸出履歴条件。CSV出力はこの条件のみを受け取る（ページングしない）"""
+
+    from_date: date | None = Field(default=None, description="貸出日開始（JST。含む）")
+    to_date: date | None = Field(
+        default=None, description="貸出日終了（JST。含む。貸出日開始以降であることは業務ルールで検証する）"
+    )
+    equipment_id: int | None = Field(default=None, ge=1, description="備品内部ID")
+    requester_id: int | None = Field(default=None, ge=1, description="借用者内部ID")
+
+
+class LoanHistoryQuery(LoanHistoryFilter, PageQuery):
+    """貸出履歴クエリ。貸出履歴条件にページング条件を加えたもの"""
+
+
+class LoanHistoryResponse(BaseModel):
+    """貸出履歴レスポンス。遅延日数は状態ではなく算出値。操作した管理者の内部IDは含めない"""
+
+    id: int = Field(ge=1, description="貸出申請内部ID")
+    equipment_id: int = Field(ge=1, description="備品内部ID")
+    equipment_asset_number: str = Field(description="備品資産番号")
+    equipment_name: str = Field(description="備品名")
+    requester_id: int = Field(ge=1, description="借用者内部ID")
+    requester_name: str = Field(description="借用者氏名")
+    requester_department: str = Field(description="借用者所属")
+    start_date: date = Field(description="開始日")
+    due_date: date = Field(description="返却予定日")
+    purpose: str = Field(description="用途")
+    status: LoanStatusValue = Field(description="状態（貸出中または返却済み）")
+    lent_at: JstDatetime = Field(description="貸出日時（JST）")
+    returned_at: JstDatetime | None = Field(description="返却日時（貸出中はnull）")
+    return_note: str = Field(description="返却時状態メモ（返却前は空文字）")
+    delay_days: int = Field(ge=0, description="遅延日数（遅れていなければ0）")

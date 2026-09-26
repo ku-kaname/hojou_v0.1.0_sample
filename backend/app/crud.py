@@ -11,7 +11,7 @@ DBへの読み書きだけを担当する。業務判断・commitは行わない
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import ColumnElement, and_, case, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -1481,3 +1481,274 @@ def get_loan_request_detail(db: Session, loan_request_id: int) -> tuple[LoanRequ
         return None
     detail = (row[0], row[1], row[2])
     return detail
+
+
+# ---- 貸出・返却・履歴 ----
+
+
+def lend_loan_request(db: Session, loan_request: LoanRequest, lent_by: int, now: datetime) -> LoanRequest:
+    """
+    貸出申請貸出更新
+
+    設計書：設計書/CRUD/貸出・返却・履歴/貸出申請貸出更新
+
+    【処理概要】
+    - 貸出申請を貸出中へ更新する（flushのみ。コミットは呼び出し元）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - loan_request (LoanRequest) : 貸出申請情報（備品・申請の行ロック取得済み。貸出可能な状態は検証済み）
+    - lent_by (int) : 貸出処理した管理者内部ID（1以上）
+    - now (datetime) : 現在日時（UTC。貸出日時に設定する）
+
+    【戻り値】
+    - loan_request (LoanRequest) : 更新した貸出申請
+
+    【例外処理】
+    - IntegrityError : 同一備品に貸出中が既にある場合（部分一意インデックスuq_loan_request_equipment_lentの違反）。
+      呼び出し元が409へ変換する
+
+    【処理フロー】
+    1. 状態を貸出中、貸出処理した管理者・貸出日時を設定して、flushする
+    2. 戻り値を設定
+    """
+    # 1. 貸出申請の更新
+    loan_request.status = LoanStatus.LENT.value
+    loan_request.lent_by = lent_by
+    loan_request.lent_at = now
+    db.flush()
+
+    # 2. 戻り値を設定
+    return loan_request
+
+
+def return_loan_request(
+    db: Session,
+    loan_request: LoanRequest,
+    returned_by: int,
+    return_note: str,
+    now: datetime,
+) -> LoanRequest:
+    """
+    貸出申請返却更新
+
+    設計書：設計書/CRUD/貸出・返却・履歴/貸出申請返却更新
+
+    【処理概要】
+    - 貸出申請を返却済みへ更新する（flushのみ。コミットは呼び出し元）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - loan_request (LoanRequest) : 貸出申請情報（貸出申請の行ロック取得済み・貸出中であることを呼び出し元で検証済み）
+    - returned_by (int) : 返却処理した管理者内部ID（1以上）
+    - return_note (str) : 返却時状態メモ（0〜200桁。空文字を許容）
+    - now (datetime) : 現在日時（UTC。返却日時に設定する）
+
+    【戻り値】
+    - loan_request (LoanRequest) : 更新した貸出申請
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 状態を返却済み、返却処理した管理者・返却日時・返却時状態メモを設定して、flushする
+    2. 戻り値を設定
+    """
+    # 1. 貸出申請の更新
+    loan_request.status = LoanStatus.RETURNED.value
+    loan_request.returned_by = returned_by
+    loan_request.returned_at = now
+    loan_request.return_note = return_note
+    db.flush()
+
+    # 2. 戻り値を設定
+    return loan_request
+
+
+def _build_loan_history_conditions(
+    lent_from: datetime | None,
+    lent_to: datetime | None,
+    equipment_id: int | None,
+    requester_id: int | None,
+) -> list[ColumnElement[bool]]:
+    """貸出履歴の絞り込み条件を組み立てる（貸出履歴検索と貸出履歴出力用取得で共通。貸出日時が存在する申請のみ）"""
+    conditions: list[ColumnElement[bool]] = [LoanRequest.lent_at.is_not(None)]
+    if lent_from is not None:
+        conditions.append(LoanRequest.lent_at >= lent_from)
+    if lent_to is not None:
+        conditions.append(LoanRequest.lent_at < lent_to)
+    if equipment_id is not None:
+        conditions.append(LoanRequest.equipment_id == equipment_id)
+    if requester_id is not None:
+        conditions.append(LoanRequest.requester_id == requester_id)
+    return conditions
+
+
+def search_loan_history(
+    db: Session,
+    lent_from: datetime | None,
+    lent_to: datetime | None,
+    equipment_id: int | None,
+    requester_id: int | None,
+    page: int,
+    page_size: int,
+) -> tuple[list[tuple[LoanRequest, Equipment, User]], int]:
+    """
+    貸出履歴検索
+
+    設計書：設計書/CRUD/貸出・返却・履歴/貸出履歴検索
+
+    【処理概要】
+    - 条件に合う貸出履歴（備品・借用者の情報を含む）の一覧・総件数を取得する。
+    - 貸出履歴は、一度でも貸し出された申請（貸出中・返却済み）とする。却下・取消・貸出前の申請は含めない。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - lent_from (datetime | None) : 貸出日時開始（UTC。この日時以上。省略時は絞り込まない）
+    - lent_to (datetime | None) : 貸出日時終了（UTC。この日時より前。省略時は絞り込まない）
+    - equipment_id (int | None) : 備品内部ID（1以上。省略時は絞り込まない）
+    - requester_id (int | None) : 借用者内部ID（1以上。省略時は絞り込まない）
+    - page (int) : ページ番号（1以上）
+    - page_size (int) : 1ページの件数（1〜100）
+
+    【戻り値】
+    - rows_and_total (tuple[list[tuple[LoanRequest, Equipment, User]], int]) : （明細一覧, 総件数）。該当なしは空リスト
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 条件に合う貸出履歴の総件数を取得
+    2. 貸出申請・備品・借用者を結合し、貸出日時と内部IDの降順でページ単位に取得（備品・借用者は有効・無効を問わない）
+    3. 戻り値を設定
+    """
+    # 1. 総件数取得
+    conditions = _build_loan_history_conditions(lent_from, lent_to, equipment_id, requester_id)
+    count_statement = select(func.count(LoanRequest.id)).where(*conditions)
+    total = db.execute(count_statement).scalar_one()
+
+    # 2. 一覧取得（同時刻でも順序が安定するよう内部IDを併用する）
+    offset = (page - 1) * page_size
+    list_statement = (
+        select(LoanRequest, Equipment, User)
+        .join(Equipment, Equipment.id == LoanRequest.equipment_id)
+        .join(User, User.id == LoanRequest.requester_id)
+        .where(*conditions)
+        .order_by(LoanRequest.lent_at.desc(), LoanRequest.id.desc())
+        .limit(page_size)
+        .offset(offset)
+    )
+    result_rows = db.execute(list_statement).all()
+    rows: list[tuple[LoanRequest, Equipment, User]] = [(row[0], row[1], row[2]) for row in result_rows]
+
+    # 3. 戻り値を設定
+    rows_and_total = (rows, total)
+    return rows_and_total
+
+
+def get_loan_history_for_export(
+    db: Session,
+    lent_from: datetime | None,
+    lent_to: datetime | None,
+    equipment_id: int | None,
+    requester_id: int | None,
+    limit: int,
+) -> list[tuple[LoanRequest, Equipment, User]]:
+    """
+    貸出履歴出力用取得
+
+    設計書：設計書/CRUD/貸出・返却・履歴/貸出履歴出力用取得
+
+    【処理概要】
+    - CSV出力用に、条件に合う貸出履歴（備品・借用者の情報を含む）を、件数上限つきで取得する。
+    - 貸出履歴検索と同じ条件・並び順で、ページングせずに上限件数まで取得する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - lent_from (datetime | None) : 貸出日時開始（UTC。この日時以上。省略時は絞り込まない）
+    - lent_to (datetime | None) : 貸出日時終了（UTC。この日時より前。省略時は絞り込まない）
+    - equipment_id (int | None) : 備品内部ID（1以上。省略時は絞り込まない）
+    - requester_id (int | None) : 借用者内部ID（1以上。省略時は絞り込まない）
+    - limit (int) : 取得上限件数（1以上。呼び出し元が「出力上限＋1」を指定し、超過を検知する）
+
+    【戻り値】
+    - rows (list[tuple[LoanRequest, Equipment, User]]) : 明細一覧。該当なしは空リスト
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 貸出申請・備品・借用者を結合し、貸出日時と内部IDの降順で上限件数まで取得
+    2. 戻り値を設定
+    """
+    # 1. 貸出履歴取得
+    conditions = _build_loan_history_conditions(lent_from, lent_to, equipment_id, requester_id)
+    statement = (
+        select(LoanRequest, Equipment, User)
+        .join(Equipment, Equipment.id == LoanRequest.equipment_id)
+        .join(User, User.id == LoanRequest.requester_id)
+        .where(*conditions)
+        .order_by(LoanRequest.lent_at.desc(), LoanRequest.id.desc())
+        .limit(limit)
+    )
+    result_rows = db.execute(statement).all()
+    rows: list[tuple[LoanRequest, Equipment, User]] = [(row[0], row[1], row[2]) for row in result_rows]
+
+    # 2. 戻り値を設定
+    return rows
+
+
+def get_overdue_loan_requests(
+    db: Session,
+    today: date,
+    page: int,
+    page_size: int,
+) -> tuple[list[tuple[LoanRequest, Equipment, User]], int]:
+    """
+    期限超過貸出一覧取得
+
+    設計書：設計書/CRUD/貸出・返却・履歴/期限超過貸出一覧取得
+
+    【処理概要】
+    - 貸出中かつ返却予定日が今日より前の申請（備品・申請者の情報を含む）の一覧・総件数を取得する。
+    - 返却予定日の古い順（遅延の大きい順）にページ単位で取得する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - today (date) : 今日（JSTの暦日）
+    - page (int) : ページ番号（1以上）
+    - page_size (int) : 1ページの件数（1〜100）
+
+    【戻り値】
+    - rows_and_total (tuple[list[tuple[LoanRequest, Equipment, User]], int]) : （明細一覧, 総件数）。該当なしは空リスト
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 状態が貸出中で返却予定日が今日より前の貸出申請の総件数を取得（返却予定日当日は期限超過に含めない）
+    2. 貸出申請・備品・申請者を結合し、返却予定日と内部IDの昇順でページ単位に取得
+    3. 戻り値を設定
+    """
+    # 1. 総件数取得
+    conditions = [LoanRequest.status == LoanStatus.LENT.value, LoanRequest.due_date < today]
+    count_statement = select(func.count(LoanRequest.id)).where(*conditions)
+    total = db.execute(count_statement).scalar_one()
+
+    # 2. 一覧取得（同日でも順序が安定するよう内部IDを併用する）
+    offset = (page - 1) * page_size
+    list_statement = (
+        select(LoanRequest, Equipment, User)
+        .join(Equipment, Equipment.id == LoanRequest.equipment_id)
+        .join(User, User.id == LoanRequest.requester_id)
+        .where(*conditions)
+        .order_by(LoanRequest.due_date.asc(), LoanRequest.id.asc())
+        .limit(page_size)
+        .offset(offset)
+    )
+    result_rows = db.execute(list_statement).all()
+    rows: list[tuple[LoanRequest, Equipment, User]] = [(row[0], row[1], row[2]) for row in result_rows]
+
+    # 3. 戻り値を設定
+    rows_and_total = (rows, total)
+    return rows_and_total
