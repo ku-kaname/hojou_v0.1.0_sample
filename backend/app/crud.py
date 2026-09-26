@@ -8,13 +8,14 @@ DBへの読み書きだけを担当する。業務判断・commitは行わない
 設計書：設計書/CRUD/
 """
 
+from dataclasses import dataclass
 from datetime import date, datetime
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.models import LoanRequest, LoanStatus, Notification, NotificationType, Role, User
+from app.models import Equipment, LoanRequest, LoanStatus, Notification, NotificationType, Role, User
 
 # 日次通知（同日に1件だけ生成する種別）
 _DAILY_NOTIFICATION_TYPES = (NotificationType.DUE_SOON.value, NotificationType.OVERDUE.value)
@@ -618,3 +619,519 @@ def cancel_pending_by_requester(
 
     # 3. 戻り値を設定
     return canceled_loan_requests
+
+
+@dataclass(frozen=True)
+class EquipmentCreateRow:
+    """備品一括作成の入力1件分（資産番号・備品名・分類・説明・保管場所。備品作成の引数と同じ制限）"""
+
+    asset_number: str
+    name: str
+    category: str
+    description: str
+    location: str
+
+
+def get_equipment_by_id(db: Session, equipment_id: int, for_update: bool = False) -> Equipment | None:
+    """
+    備品内部ID指定取得
+
+    設計書：設計書/CRUD/備品管理/備品内部ID指定取得
+
+    【処理概要】
+    - 内部IDを指定して備品情報を1件取得する（有効・無効を問わない）。
+    - 備品の取得・編集・予約状況確認、および貸出申請・承認・貸出の各処理から利用される。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - equipment_id (int) : 備品内部ID（1以上）
+    - for_update (bool) : 行ロック要否。Trueの場合はFOR UPDATEで行ロックする（省略時False）
+
+    【戻り値】
+    - equipment (Equipment | None) : 備品情報（該当なしはNone）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. equipmentテーブルから内部IDが一致するレコードを取得（有効フラグでは絞り込まない）
+    2. 戻り値を設定
+    """
+    # 1. 備品情報取得
+    statement = select(Equipment).where(Equipment.id == equipment_id)
+    if for_update:
+        # 再取得時に最新値を読むため、populate_existingで既存の読み込み済み値も更新する
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    equipment = db.execute(statement).scalar_one_or_none()
+
+    # 2. 戻り値を設定
+    return equipment
+
+
+def get_equipment_by_asset_number(db: Session, asset_number: str) -> Equipment | None:
+    """
+    備品資産番号指定取得
+
+    設計書：設計書/CRUD/備品管理/備品資産番号指定取得
+
+    【処理概要】
+    - 資産番号を指定して備品情報を1件取得する（有効・無効を問わない）。
+    - 備品登録時の重複確認から利用される。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - asset_number (str) : 資産番号（1〜32桁）
+
+    【戻り値】
+    - equipment (Equipment | None) : 備品情報（該当なしはNone）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. equipmentテーブルから資産番号が完全一致するレコードを取得（無効化済みも対象）
+    2. 戻り値を設定
+    """
+    # 1. 備品情報取得
+    statement = select(Equipment).where(Equipment.asset_number == asset_number)
+    equipment = db.execute(statement).scalar_one_or_none()
+
+    # 2. 戻り値を設定
+    return equipment
+
+
+def create_equipment(
+    db: Session,
+    asset_number: str,
+    name: str,
+    category: str,
+    description: str,
+    location: str,
+    now: datetime,
+) -> Equipment:
+    """
+    備品作成
+
+    設計書：設計書/CRUD/備品管理/備品作成
+
+    【処理概要】
+    - 備品を1件登録する。equipmentテーブルへ1件追加する（flushのみ。コミットは呼び出し元）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - asset_number (str) : 資産番号（1〜32桁）
+    - name (str) : 備品名（1〜100桁）
+    - category (str) : 分類（1〜50桁）
+    - description (str) : 説明（0〜500桁。空文字を許容）
+    - location (str) : 保管場所（0〜100桁。空文字を許容）
+    - now (datetime) : 現在日時
+
+    【戻り値】
+    - equipment (Equipment) : 登録した備品情報（採番された内部IDを含む）
+
+    【例外処理】
+    - IntegrityError : 資産番号の一意制約に違反した場合（呼び出し元が409として扱う）
+
+    【処理フロー】
+    1. equipmentテーブルへ登録（有効フラグ=TRUE、作成日時・更新日時=現在日時）
+    2. 戻り値を設定
+    """
+    # 1. 備品登録
+    equipment = Equipment(
+        asset_number=asset_number,
+        name=name,
+        category=category,
+        description=description,
+        location=location,
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(equipment)
+    db.flush()
+
+    # 2. 戻り値を設定
+    return equipment
+
+
+def create_equipments(db: Session, rows: list[EquipmentCreateRow], now: datetime) -> int:
+    """
+    備品一括作成
+
+    設計書：設計書/CRUD/備品管理/備品一括作成
+
+    【処理概要】
+    - 備品を複数件まとめて登録する（CSV一括登録用）。
+    - equipmentテーブルへ複数件を追加する（flushのみ。コミットは呼び出し元）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - rows (list[EquipmentCreateRow]) : 備品登録内容一覧（1〜1,000件。各要素は備品作成の引数と同じ制限）
+    - now (datetime) : 現在日時
+
+    【戻り値】
+    - count (int) : 登録件数
+
+    【例外処理】
+    - IntegrityError : 資産番号の一意制約に違反した場合
+      （呼び出し元が409として扱う。1件でも失敗した場合は全件登録されない＝呼び出し元がロールバックする）
+
+    【処理フロー】
+    1. 備品登録内容一覧の各要素を、備品作成と同じ内容でequipmentテーブルへ登録
+    2. 戻り値を設定
+    """
+    # 1. 備品一括登録
+    equipments = []
+    for row in rows:
+        equipment = Equipment(
+            asset_number=row.asset_number,
+            name=row.name,
+            category=row.category,
+            description=row.description,
+            location=row.location,
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        equipments.append(equipment)
+    db.add_all(equipments)
+    db.flush()
+
+    # 2. 戻り値を設定
+    count = len(equipments)
+    return count
+
+
+def update_equipment(
+    db: Session,
+    equipment: Equipment,
+    name: str,
+    category: str,
+    description: str,
+    location: str,
+    is_active: bool,
+    now: datetime,
+) -> Equipment:
+    """
+    備品情報更新
+
+    設計書：設計書/CRUD/備品管理/備品情報更新
+
+    【処理概要】
+    - 備品の備品名・分類・説明・保管場所・有効フラグを更新する（資産番号は変更しない）。
+    - 取得済みの備品情報を更新する（flushのみ。コミットは呼び出し元）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - equipment (Equipment) : 更新対象の備品情報（取得済み）
+    - name (str) : 備品名（1〜100桁）
+    - category (str) : 分類（1〜50桁）
+    - description (str) : 説明（0〜500桁）
+    - location (str) : 保管場所（0〜100桁）
+    - is_active (bool) : 有効フラグ
+    - now (datetime) : 現在日時
+
+    【戻り値】
+    - equipment (Equipment) : 更新後の備品情報
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 備品名・分類・説明・保管場所・有効フラグ・更新日時を更新
+    2. 戻り値を設定
+    """
+    # 1. 備品情報更新
+    equipment.name = name
+    equipment.category = category
+    equipment.description = description
+    equipment.location = location
+    equipment.is_active = is_active
+    equipment.updated_at = now
+    db.flush()
+
+    # 2. 戻り値を設定
+    return equipment
+
+
+def get_equipments(
+    db: Session,
+    keyword: str | None,
+    category: str | None,
+    availability: str | None,
+    include_inactive: bool,
+    page: int,
+    page_size: int,
+) -> tuple[list[tuple[Equipment, LoanRequest | None, str | None]], int]:
+    """
+    備品一覧取得
+
+    設計書：設計書/CRUD/備品管理/備品一覧取得
+
+    【処理概要】
+    - 条件に合う備品と、各備品の現在の貸出中の申請（借用者氏名を含む）の一覧・総件数を取得する（F03）。
+    - キーワード・分類・貸出状況・有効フラグで絞り込み、内部IDの昇順でページ単位に取得する。
+    - 貸出中の申請は備品ごとに高々1件（部分一意インデックス）のため、外部結合で行数は増えない。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - keyword (str | None) : 資産番号または備品名の部分一致（省略時は絞り込まない）
+    - category (str | None) : 分類の完全一致（省略時は絞り込まない）
+    - availability (str | None) : available（貸出可＝貸出中の申請なし）またはlent（貸出中）。省略時は絞り込まない
+    - include_inactive (bool) : 無効化済み含む要否。Falseの場合は有効な備品のみ
+    - page (int) : ページ番号（1以上）
+    - page_size (int) : 1ページの件数（1〜100）
+
+    【戻り値】
+    - items (list[tuple[Equipment, LoanRequest | None, str | None]]) :
+      （備品情報, 貸出中の申請, 借用者氏名）の一覧。貸出中でない備品の申請・氏名はNone。0件は空リスト
+    - total (int) : 総件数
+    ※タプル（備品一覧, 総件数）で返却する
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 総件数取得
+    2. 一覧取得（内部ID昇順・LIMIT/OFFSET。貸出中の申請と借用者氏名を併せて取得）
+    3. 戻り値を設定
+    """
+    # 貸出中の申請・借用者との外部結合条件（貸出中は備品ごとに高々1件）
+    lent_join_condition = and_(LoanRequest.equipment_id == Equipment.id, LoanRequest.status == LoanStatus.LENT.value)
+    borrower_join_condition = User.id == LoanRequest.requester_id
+
+    # 絞り込み条件の作成
+    conditions = []
+    if keyword:
+        escaped_keyword = _escape_like(keyword)
+        like_pattern = "%" + escaped_keyword + "%"
+        asset_number_condition = Equipment.asset_number.ilike(like_pattern, escape="\\")
+        name_condition = Equipment.name.ilike(like_pattern, escape="\\")
+        conditions.append(or_(asset_number_condition, name_condition))
+    if category is not None:
+        conditions.append(Equipment.category == category)
+    if not include_inactive:
+        conditions.append(Equipment.is_active.is_(True))
+    if availability == "available":
+        conditions.append(LoanRequest.id.is_(None))
+    elif availability == "lent":
+        conditions.append(LoanRequest.id.is_not(None))
+
+    # 1. 総件数取得
+    count_statement = (
+        select(func.count(Equipment.id))
+        .select_from(Equipment)
+        .outerjoin(LoanRequest, lent_join_condition)
+        .where(*conditions)
+    )
+    total = db.execute(count_statement).scalar_one()
+
+    # 2. 一覧取得
+    offset = (page - 1) * page_size
+    list_statement = (
+        select(Equipment, LoanRequest, User.name)
+        .select_from(Equipment)
+        .outerjoin(LoanRequest, lent_join_condition)
+        .outerjoin(User, borrower_join_condition)
+        .where(*conditions)
+        .order_by(Equipment.id.asc())
+        .limit(page_size)
+        .offset(offset)
+    )
+    rows = db.execute(list_statement).all()
+    items: list[tuple[Equipment, LoanRequest | None, str | None]] = [
+        (equipment, lent_loan, borrower_name) for equipment, lent_loan, borrower_name in rows
+    ]
+
+    # 3. 戻り値を設定
+    return items, total
+
+
+def get_categories(db: Session) -> list[str]:
+    """
+    分類一覧取得
+
+    設計書：設計書/CRUD/備品管理/分類一覧取得
+
+    【処理概要】
+    - 検索条件の選択肢として、有効な備品の分類を重複なしで取得する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+
+    【戻り値】
+    - categories (list[str]) : 分類の一覧（昇順。0件は空リスト）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. equipmentテーブルから有効な備品の分類を重複を除いて昇順で取得
+    2. 戻り値を設定
+    """
+    # 1. 分類取得
+    statement = select(Equipment.category).where(Equipment.is_active.is_(True)).distinct().order_by(Equipment.category)
+    result = db.execute(statement).scalars().all()
+
+    # 2. 戻り値を設定
+    categories = list(result)
+    return categories
+
+
+def get_existing_asset_numbers(db: Session, asset_numbers: list[str]) -> set[str]:
+    """
+    既存資産番号一覧取得
+
+    設計書：設計書/CRUD/備品管理/既存資産番号一覧取得
+
+    【処理概要】
+    - 指定した資産番号のうち、既にequipmentテーブルに登録されているものを取得する（CSV一括登録の重複確認用）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - asset_numbers (list[str]) : 資産番号の一覧（最大1,000件。各1〜32桁。0件の場合は検索せず空集合を返す）
+
+    【戻り値】
+    - existing (set[str]) : 既に登録されている資産番号（無効化済みも対象。0件は空集合）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 資産番号の一覧が0件の場合は、検索せずに空集合を返す
+    2. equipmentテーブルから、資産番号が一覧に含まれるものを取得
+    3. 戻り値を設定
+    """
+    # 1. 0件の場合は検索しない
+    if not asset_numbers:
+        return set()
+
+    # 2. 既存資産番号取得
+    statement = select(Equipment.asset_number).where(Equipment.asset_number.in_(asset_numbers))
+    result = db.execute(statement).scalars().all()
+
+    # 3. 戻り値を設定
+    existing = set(result)
+    return existing
+
+
+def count_open_loans_by_equipment(db: Session, equipment_id: int) -> int:
+    """
+    備品未完了申請件数取得
+
+    設計書：設計書/CRUD/備品管理/備品未完了申請件数取得
+
+    【処理概要】
+    - 備品に紐づく、申請中・承認済み・貸出中の申請の件数を取得する（備品の無効化可否の判定用）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - equipment_id (int) : 備品内部ID（1以上）
+
+    【戻り値】
+    - count (int) : 件数
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. loan_requestテーブルから、備品が一致し状態が申請中・承認済み・貸出中の件数を取得
+    2. 戻り値を設定
+    """
+    # 1. 件数取得
+    open_statuses = [LoanStatus.REQUESTED.value, LoanStatus.APPROVED.value, LoanStatus.LENT.value]
+    statement = (
+        select(func.count())
+        .select_from(LoanRequest)
+        .where(LoanRequest.equipment_id == equipment_id, LoanRequest.status.in_(open_statuses))
+    )
+    count = db.execute(statement).scalar_one()
+
+    # 2. 戻り値を設定
+    return count
+
+
+def get_lent_loan_by_equipment(db: Session, equipment_id: int) -> tuple[LoanRequest, str] | None:
+    """
+    貸出中申請取得
+
+    設計書：設計書/CRUD/備品管理/貸出中申請取得
+
+    【処理概要】
+    - 備品を指定して、現在貸出中の申請（借用者氏名を含む）を取得する（備品ごとに高々1件）。
+    - 備品取得（F03）で現在の貸出状況を返す際に利用される。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - equipment_id (int) : 備品内部ID（1以上）
+
+    【戻り値】
+    - lent_loan (tuple[LoanRequest, str] | None) : （貸出中の申請, 借用者氏名）。貸出中でない場合はNone
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. loan_requestテーブルから、備品が一致し状態が貸出中の申請を借用者氏名とともに取得
+    2. 戻り値を設定
+    """
+    # 1. 貸出中申請取得
+    statement = (
+        select(LoanRequest, User.name)
+        .join(User, User.id == LoanRequest.requester_id)
+        .where(LoanRequest.equipment_id == equipment_id, LoanRequest.status == LoanStatus.LENT.value)
+    )
+    row = db.execute(statement).first()
+
+    # 2. 戻り値を設定
+    if row is None:
+        return None
+    lent_loan = (row[0], row[1])
+    return lent_loan
+
+
+def get_reservations(db: Session, equipment_id: int, base_date: date) -> list[tuple[LoanRequest, str]]:
+    """
+    予約期間一覧取得
+
+    設計書：設計書/CRUD/備品管理/予約期間一覧取得
+
+    【処理概要】
+    - 備品の承認済み・貸出中の申請（予約期間）を、借用者氏名とともに取得する（F04）。
+    - 備品が一致し状態が承認済みまたは貸出中で、占有終了日が基準日以降の申請を開始日の昇順で取得する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - equipment_id (int) : 備品内部ID（1以上）
+    - base_date (date) : 基準日（JST今日。これより前に占有が終わっている申請は返却しない）
+
+    【戻り値】
+    - reservations (list[tuple[LoanRequest, str]]) : （貸出申請, 借用者氏名）の一覧。0件は空リスト
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. loan_requestテーブルから、備品が一致し状態が承認済み・貸出中の申請を開始日の昇順で取得
+       （貸出中は返却されるまで占有するため常に含める。承認済みは返却予定日が基準日以降のもののみ）
+    2. 戻り値を設定
+    """
+    # 1. 予約期間取得
+    statuses = [LoanStatus.APPROVED.value, LoanStatus.LENT.value]
+    is_lent = LoanRequest.status == LoanStatus.LENT.value
+    is_not_ended = LoanRequest.due_date >= base_date
+    statement = (
+        select(LoanRequest, User.name)
+        .join(User, User.id == LoanRequest.requester_id)
+        .where(
+            LoanRequest.equipment_id == equipment_id,
+            LoanRequest.status.in_(statuses),
+            or_(is_lent, is_not_ended),
+        )
+        .order_by(LoanRequest.start_date.asc(), LoanRequest.id.asc())
+    )
+    rows = db.execute(statement).all()
+
+    # 2. 戻り値を設定
+    reservations = [(loan, borrower_name) for loan, borrower_name in rows]
+    return reservations

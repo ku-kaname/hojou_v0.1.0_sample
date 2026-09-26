@@ -5,14 +5,20 @@
 業務ルールの判断とトランザクション（commit）の管理を担当する。
 本ファイルは、機能群ごとの実装に伴い関数が追加される。共通部分として、現在日時取得・今日取得・通知生成を持つ。
 認証・ユーザー管理の機能群として、ログイン・パスワード変更・ユーザー管理・初期管理者作成の処理を持つ。
+備品管理の機能群として、備品の検索・取得・登録・編集・分類一覧・予約状況・CSV一括登録の処理を持つ。
 
-設計書：設計書/サーバー処理（main）/共通/、設計書/サーバー処理（main）/認証・ユーザー管理/
+設計書：設計書/サーバー処理（main）/共通/、設計書/サーバー処理（main）/認証・ユーザー管理/、
+設計書/サーバー処理（main）/備品管理/
 """
 
+import csv
+import io
 import logging
 import os
 import re
+import unicodedata
 from datetime import UTC, date, datetime, timedelta
+from typing import Literal
 
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
@@ -20,15 +26,25 @@ from sqlalchemy.orm import Session
 
 from app import crud
 from app.auth import build_credentials_error, create_access_token, hash_password, verify_password
-from app.models import NotificationType, Role, User
+from app.crud import EquipmentCreateRow
+from app.models import Equipment, LoanRequest, LoanStatus, NotificationType, Role, User
 from app.schemas import (
     JST,
     AuthenticatedUser,
+    CategoryListResponse,
+    CsvImportResponse,
+    CsvRowError,
+    EquipmentCreateRequest,
+    EquipmentListQuery,
+    EquipmentResponse,
+    EquipmentUpdateRequest,
     LoginRequest,
     MeResponse,
     Page,
     PasswordChangeRequest,
     PasswordResetRequest,
+    ReservationListResponse,
+    ReservationResponse,
     TokenResponse,
     UserCreateRequest,
     UserListQuery,
@@ -45,6 +61,31 @@ LOCK_MINUTES = 15
 _CURRENT_PASSWORD_ERROR = "現在のパスワードが正しくありません"
 _LOGIN_ID_DUPLICATE_ERROR = "このユーザーIDは既に登録されています"
 _USER_NOT_FOUND_ERROR = "ユーザーが見つかりません"
+
+_EQUIPMENT_NOT_FOUND_ERROR = "備品が見つかりません"
+_ASSET_NUMBER_DUPLICATE_ERROR = "この資産番号は既に登録されています"
+_EQUIPMENT_DEACTIVATE_ERROR = "申請中・承認済み・貸出中の申請がある備品は無効化できません"
+_FORBIDDEN_ERROR = "この操作を行う権限がありません"
+
+# 備品CSV一括登録の設定（列名・最小桁・最大桁。列の順序どおり）
+_ASSET_NUMBER_PATTERN = r"[A-Za-z0-9-]+"
+_CSV_COLUMNS = (
+    ("資産番号", 1, 32),
+    ("備品名", 1, 100),
+    ("分類", 1, 50),
+    ("説明", 0, 500),
+    ("保管場所", 0, 100),
+)
+_CSV_MAX_ROWS = 1000
+_CSV_MAX_ERRORS = 100
+_LINE_BREAK_PATTERN = re.compile(r"\r\n|\r|\n")
+_CSV_CONTENT_ERROR = "CSVの内容に誤りがあります"
+_CSV_ENCODING_ERROR = "CSVの文字コードがUTF-8ではありません"
+_CSV_FORMAT_ERROR = "CSVの形式が正しくありません"
+_CSV_HEADER_ERROR = "ヘッダー行が正しくありません（資産番号,備品名,分類,説明,保管場所）"
+_CSV_NO_DATA_ERROR = "登録するデータ行がありません"
+_CSV_TOO_MANY_ROWS_ERROR = "データ行が上限（1,000行）を超えています"
+_CSV_CONFLICT_ERROR = "資産番号が既に登録されています。再度お試しください"
 
 
 def get_now() -> datetime:
@@ -434,20 +475,18 @@ def register_user(db: Session, request: UserCreateRequest) -> UserResponse:
     # 3. 初期パスワードのハッシュ化
     password_hash = hash_password(request.initial_password)
 
-    # 4. ユーザー作成
-    user = crud.create_user(
-        db,
-        request.login_id,
-        request.name,
-        request.department,
-        password_hash,
-        request.role,
-        True,
-        now,
-    )
-
-    # 5. コミット
+    # 4. ユーザー作成・5. コミット（同時登録によるユーザーIDの重複はDBの一意制約で検出する）
     try:
+        user = crud.create_user(
+            db,
+            request.login_id,
+            request.name,
+            request.department,
+            password_hash,
+            request.role,
+            True,
+            now,
+        )
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -732,3 +771,589 @@ def ensure_initial_admin(db: Session) -> None:
 
     # 8. ログ記録（パスワードは記録しない）
     logger.info("初期管理者を作成しました: ユーザーID=%s", login_id)
+
+
+# ---- 備品管理 ----
+
+
+class CsvImportError(Exception):
+    """
+    CSV一括登録の内容エラー
+
+    行別エラー（行番号・列名・エラー内容）を保持する。エンドポイント層の専用の例外ハンドラーが、
+    ステータスコード400のCSVエラーレスポンス（CsvImportErrorResponse）へ変換する。
+    """
+
+    def __init__(self, errors: list[CsvRowError]) -> None:
+        super().__init__(_CSV_CONTENT_ERROR)
+        self.errors = errors
+
+
+def _to_equipment_response(
+    equipment: Equipment,
+    lent_loan: LoanRequest | None,
+    borrower_name: str | None,
+    today: date,
+    is_admin: bool,
+) -> EquipmentResponse:
+    """
+    備品レスポンス変換（共通の内部処理）
+
+    備品・貸出中の申請・借用者氏名から、備品レスポンスを作る。
+    貸出状況は貸出中の申請の有無から算出し、借用者氏名は管理者にのみ設定する（一般ユーザーにはNULL）。
+    期限超過は「貸出中かつ返却予定日が今日（JST）より前」の場合に真とする。
+    """
+    availability: Literal["available", "lent"] = "available"
+    current_due_date = None
+    is_overdue = False
+    current_borrower_name = None
+    if lent_loan is not None:
+        availability = "lent"
+        current_due_date = lent_loan.due_date
+        is_overdue = lent_loan.due_date < today
+        if is_admin:
+            current_borrower_name = borrower_name
+    equipment_response = EquipmentResponse(
+        id=equipment.id,
+        asset_number=equipment.asset_number,
+        name=equipment.name,
+        category=equipment.category,
+        description=equipment.description,
+        location=equipment.location,
+        is_active=equipment.is_active,
+        availability=availability,
+        current_due_date=current_due_date,
+        is_overdue=is_overdue,
+        current_borrower_name=current_borrower_name,
+        created_at=equipment.created_at,
+        updated_at=equipment.updated_at,
+    )
+    return equipment_response
+
+
+def _get_visible_equipment(db: Session, equipment_id: int, authenticated_user: AuthenticatedUser) -> Equipment:
+    """
+    閲覧可能な備品の取得（共通の内部処理）
+
+    備品を内部IDで取得する。存在しない場合、および無効化済みで呼び出し元が管理者でない場合は、
+    無効化済みの存在を一般ユーザーに知らせないため、いずれも404とする。
+    """
+    equipment = crud.get_equipment_by_id(db, equipment_id, False)
+    if equipment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_EQUIPMENT_NOT_FOUND_ERROR)
+    is_admin = authenticated_user.role == Role.ADMIN.value
+    if not equipment.is_active and not is_admin:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_EQUIPMENT_NOT_FOUND_ERROR)
+    return equipment
+
+
+def search_equipments(
+    db: Session,
+    authenticated_user: AuthenticatedUser,
+    query: EquipmentListQuery,
+) -> Page[EquipmentResponse]:
+    """
+    備品一覧検索処理
+
+    設計書：設計書/サーバー処理（main）/備品管理/備品一覧検索
+
+    【処理概要】
+    - 備品を分類・キーワード・貸出状況で検索し、現在の貸出状況とともに一覧表示する。
+    - 無効化済みの備品を含める指定は管理者のみ可能とする。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー
+    - query (EquipmentListQuery) : 備品一覧クエリ
+
+    【戻り値】
+    - page_response (Page[EquipmentResponse]) : ページ形式の備品一覧
+
+    【例外処理】
+    - HTTPException(403) : 無効化済みを含める指定が、管理者以外から行われた場合
+
+    【処理フロー】
+    1. 権限の検証
+    2. 備品一覧の取得（今日の取得・備品と現在の貸出状況の取得）
+    3. 戻り値を設定
+    """
+    # 1. 権限の検証
+    is_admin = authenticated_user.role == Role.ADMIN.value
+    if query.include_inactive and not is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_FORBIDDEN_ERROR)
+
+    # 2. 備品一覧の取得
+    today = get_today()
+    items, total = crud.get_equipments(
+        db,
+        query.keyword,
+        query.category,
+        query.availability,
+        query.include_inactive,
+        query.page,
+        query.page_size,
+    )
+
+    # 3. 戻り値を設定
+    responses = [
+        _to_equipment_response(equipment, lent_loan, borrower_name, today, is_admin)
+        for equipment, lent_loan, borrower_name in items
+    ]
+    page_response = Page[EquipmentResponse](
+        items=responses,
+        total=total,
+        page=query.page,
+        page_size=query.page_size,
+    )
+    return page_response
+
+
+def get_equipment_detail(db: Session, authenticated_user: AuthenticatedUser, equipment_id: int) -> EquipmentResponse:
+    """
+    備品取得処理
+
+    設計書：設計書/サーバー処理（main）/備品管理/備品取得
+
+    【処理概要】
+    - 備品1件の詳細と現在の貸出状況を取得する（備品詳細画面用）。
+    - 無効化済みは、管理者以外には存在しないものとして扱う。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー
+    - equipment_id (int) : 備品内部ID
+
+    【戻り値】
+    - equipment_response (EquipmentResponse) : 備品
+
+    【例外処理】
+    - HTTPException(404) : 備品が存在しない場合、または無効化済みで呼び出し元が管理者でない場合
+      （"備品が見つかりません"）
+
+    【処理フロー】
+    1. 備品の取得
+    2. 現在の貸出状況の取得（今日の取得・貸出中の申請の取得）
+    3. 戻り値を設定
+    """
+    # 1. 備品の取得
+    equipment = _get_visible_equipment(db, equipment_id, authenticated_user)
+
+    # 2. 現在の貸出状況の取得
+    today = get_today()
+    lent_result = crud.get_lent_loan_by_equipment(db, equipment_id)
+    lent_loan = None
+    borrower_name = None
+    if lent_result is not None:
+        lent_loan, borrower_name = lent_result
+
+    # 3. 戻り値を設定
+    is_admin = authenticated_user.role == Role.ADMIN.value
+    equipment_response = _to_equipment_response(equipment, lent_loan, borrower_name, today, is_admin)
+    return equipment_response
+
+
+def list_equipment_categories(db: Session) -> CategoryListResponse:
+    """
+    分類一覧取得処理
+
+    設計書：設計書/サーバー処理（main）/備品管理/分類一覧取得
+
+    【処理概要】
+    - 備品検索の絞り込み選択肢として、有効な備品の分類を返す。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+
+    【戻り値】
+    - category_response (CategoryListResponse) : 分類一覧（0件は空配列）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 分類の取得
+    2. 戻り値を設定
+    """
+    # 1. 分類の取得
+    categories = crud.get_categories(db)
+
+    # 2. 戻り値を設定
+    category_response = CategoryListResponse(items=categories)
+    return category_response
+
+
+def get_equipment_reservations(
+    db: Session,
+    authenticated_user: AuthenticatedUser,
+    equipment_id: int,
+) -> ReservationListResponse:
+    """
+    予約状況取得処理
+
+    設計書：設計書/サーバー処理（main）/備品管理/予約状況取得
+
+    【処理概要】
+    - 備品の承認済み・貸出中の期間を返し、利用者が空き期間を把握できるようにする。
+    - 借用者氏名は管理者にのみ返す。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー
+    - equipment_id (int) : 備品内部ID
+
+    【戻り値】
+    - reservation_response (ReservationListResponse) : 予約状況（開始日の昇順。0件は空配列）
+
+    【例外処理】
+    - HTTPException(404) : 備品が存在しない場合、または無効化済みで呼び出し元が管理者でない場合
+      （"備品が見つかりません"）
+
+    【処理フロー】
+    1. 備品の確認
+    2. 予約期間の取得（今日の取得・予約期間一覧の取得）
+    3. 戻り値を設定（貸出中の占有終了日は、返却予定日と今日のうち遅い方）
+    """
+    # 1. 備品の確認
+    _get_visible_equipment(db, equipment_id, authenticated_user)
+
+    # 2. 予約期間の取得
+    today = get_today()
+    reservations = crud.get_reservations(db, equipment_id, today)
+
+    # 3. 戻り値を設定
+    is_admin = authenticated_user.role == Role.ADMIN.value
+    items = []
+    for loan, borrower_name in reservations:
+        occupied_until = loan.due_date
+        if loan.status == LoanStatus.LENT.value and today > loan.due_date:
+            occupied_until = today
+        reservation = ReservationResponse(
+            start_date=loan.start_date,
+            due_date=loan.due_date,
+            occupied_until=occupied_until,
+            status="lent" if loan.status == LoanStatus.LENT.value else "approved",
+            borrower_name=borrower_name if is_admin else None,
+        )
+        items.append(reservation)
+    reservation_response = ReservationListResponse(items=items)
+    return reservation_response
+
+
+def register_equipment(db: Session, request: EquipmentCreateRequest) -> EquipmentResponse:
+    """
+    備品登録処理
+
+    設計書：設計書/サーバー処理（main）/備品管理/備品登録
+
+    【処理概要】
+    - 管理者が備品を1点登録する。資産番号の重複を検証し、有効な備品として登録する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - request (EquipmentCreateRequest) : 備品登録リクエスト
+
+    【戻り値】
+    - equipment_response (EquipmentResponse) : 登録した備品
+      （貸出状況available・現在の返却予定日NULL・期限超過False・借用者氏名NULL）
+
+    【例外処理】
+    - HTTPException(409) : 資産番号が既に登録されている場合（無効化済みを含む。"この資産番号は既に登録されています"）
+
+    【処理フロー】
+    1. 現在日時の取得
+    2. 資産番号の重複確認
+    3. 備品の登録
+    4. コミット（同時登録による一意制約違反は409）
+    5. 戻り値を設定
+    """
+    # 1. 現在日時の取得
+    now = get_now()
+
+    # 2. 資産番号の重複確認
+    existing_equipment = crud.get_equipment_by_asset_number(db, request.asset_number)
+    if existing_equipment is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_ASSET_NUMBER_DUPLICATE_ERROR)
+
+    # 3. 備品の登録・4. コミット（同時登録による資産番号の重複はDBの一意制約で検出する）
+    try:
+        equipment = crud.create_equipment(
+            db,
+            request.asset_number,
+            request.name,
+            request.category,
+            request.description,
+            request.location,
+            now,
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_ASSET_NUMBER_DUPLICATE_ERROR) from None
+
+    # 5. 戻り値を設定（登録直後は貸出中の申請がない）
+    today = get_today()
+    equipment_response = _to_equipment_response(equipment, None, None, today, True)
+    return equipment_response
+
+
+def update_equipment_admin(db: Session, equipment_id: int, request: EquipmentUpdateRequest) -> EquipmentResponse:
+    """
+    備品編集処理
+
+    設計書：設計書/サーバー処理（main）/備品管理/備品編集
+
+    【処理概要】
+    - 管理者が備品の内容を更新する。有効フラグによる無効化・再有効化を含む。資産番号は変更しない。
+    - 備品を行ロックして取得し、無効化時は未完了の申請がないことを検証したうえで更新する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - equipment_id (int) : 備品内部ID
+    - request (EquipmentUpdateRequest) : 備品編集リクエスト
+
+    【戻り値】
+    - equipment_response (EquipmentResponse) : 更新後の備品（管理者のため借用者氏名を設定）
+
+    【例外処理】
+    - HTTPException(404) : 備品が存在しない場合（"備品が見つかりません"）
+    - HTTPException(400) : 申請中・承認済み・貸出中の申請がある備品を無効化する場合
+      （"申請中・承認済み・貸出中の申請がある備品は無効化できません"）
+
+    【処理フロー】
+    1. 対象備品の取得とロック（現在日時の取得・備品の行ロック取得）
+    2. 無効化に該当する場合、未完了の申請がないことを検証
+    3. 備品の更新
+    4. 貸出中の申請の取得・今日の取得
+    5. コミット
+    6. 戻り値を設定
+    """
+    # 1. 対象備品の取得とロック（貸出申請・承認・貸出の各処理も同じ行ロックを取るため、競合しても整合が保たれる）
+    now = get_now()
+    equipment = crud.get_equipment_by_id(db, equipment_id, True)
+    if equipment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_EQUIPMENT_NOT_FOUND_ERROR)
+
+    # 2. 無効化に該当する場合、未完了の申請がないことを検証（再有効化・内容のみの更新は何もしない）
+    is_deactivation = equipment.is_active and not request.is_active
+    if is_deactivation:
+        open_count = crud.count_open_loans_by_equipment(db, equipment_id)
+        if open_count >= 1:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_EQUIPMENT_DEACTIVATE_ERROR)
+
+    # 3. 備品の更新
+    crud.update_equipment(
+        db,
+        equipment,
+        request.name,
+        request.category,
+        request.description,
+        request.location,
+        request.is_active,
+        now,
+    )
+
+    # 4. 貸出中の申請の取得（無効化されていない備品は貸出中の申請を持ちうるため、常に取得して返却に反映する）
+    lent_result = crud.get_lent_loan_by_equipment(db, equipment_id)
+    lent_loan = None
+    borrower_name = None
+    if lent_result is not None:
+        lent_loan, borrower_name = lent_result
+    today = get_today()
+
+    # 5. コミット
+    db.commit()
+
+    # 6. 戻り値を設定
+    equipment_response = _to_equipment_response(equipment, lent_loan, borrower_name, today, True)
+    return equipment_response
+
+
+def _decode_csv_bytes(content: bytes) -> str:
+    """CSVのバイト列をUTF-8（BOMの有無は問わない）でデコードする。デコードできない場合は400"""
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_CSV_ENCODING_ERROR) from None
+    return text
+
+
+def _parse_csv_rows(text: str) -> list[tuple[int, list[str]]]:
+    """
+    CSVを解析し、（ファイル上の行番号, セル一覧）の一覧を返す（標準のCSVパーサーを使用）
+
+    引用符・区切り文字・セル内改行に対応する。全セルが空の行（空行）は読み飛ばす。
+    行番号はヘッダー行を1行目とする、人が確認できるファイル上の行番号とする。
+    解析できない場合は400。
+    """
+    reader = csv.reader(io.StringIO(text, newline=""), strict=True)
+    rows: list[tuple[int, list[str]]] = []
+    try:
+        for cells in reader:
+            # reader.line_numは、セル内改行を含む場合その行の最後の物理行を指すため、開始行を求める
+            start_line = reader.line_num
+            for cell in cells:
+                line_breaks = _LINE_BREAK_PATTERN.findall(cell)
+                start_line -= len(line_breaks)
+            if any(cell.strip() for cell in cells):
+                rows.append((start_line, cells))
+    except csv.Error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_CSV_FORMAT_ERROR) from None
+    return rows
+
+
+def _has_control_char(value: str, allow_line_break: bool) -> bool:
+    """制御文字（改行・タブを含む）が含まれるかを判定する。allow_line_breakが真の場合、改行（CR・LF）は許容する"""
+    for char in value:
+        if allow_line_break and char in "\r\n":
+            continue
+        if unicodedata.category(char) == "Cc":
+            return True
+    return False
+
+
+def _validate_csv_row(row_number: int, cells: list[str]) -> tuple[EquipmentCreateRow | None, list[CsvRowError]]:
+    """
+    CSVのデータ1行を検証する（共通の内部処理）
+
+    列数・各項目の桁数（前後の空白を除去して判定）・資産番号の形式・制御文字を検証する。
+    誤りがなければ（前後の空白を除去した登録内容, 空リスト）、誤りがあれば（None, 行別エラー一覧）を返す。
+    """
+    if len(cells) != len(_CSV_COLUMNS):
+        return None, [CsvRowError(row_number=row_number, column=None, message="列数が正しくありません")]
+
+    errors: list[CsvRowError] = []
+    values: list[str] = []
+    for index, (column_name, min_length, max_length) in enumerate(_CSV_COLUMNS):
+        value = cells[index].strip()
+        values.append(value)
+        if not (min_length <= len(value) <= max_length):
+            message = f"{column_name}は{min_length}〜{max_length}文字で入力してください"
+            errors.append(CsvRowError(row_number=row_number, column=column_name, message=message))
+            continue
+        # 説明のみ改行を許容する
+        allow_line_break = column_name == "説明"
+        if _has_control_char(value, allow_line_break):
+            message = f"{column_name}に使用できない文字が含まれています"
+            errors.append(CsvRowError(row_number=row_number, column=column_name, message=message))
+            continue
+        if column_name == "資産番号" and not re.fullmatch(_ASSET_NUMBER_PATTERN, value):
+            message = "資産番号は半角英数字と-のみ使用できます"
+            errors.append(CsvRowError(row_number=row_number, column=column_name, message=message))
+    if errors:
+        return None, errors
+    row = EquipmentCreateRow(
+        asset_number=values[0],
+        name=values[1],
+        category=values[2],
+        description=values[3],
+        location=values[4],
+    )
+    return row, []
+
+
+def _get_error_row_number(error: CsvRowError) -> int:
+    """行別エラーの行番号を返す（行番号の昇順に並べるための取得関数。同じ行内では発生順を保つ）"""
+    return error.row_number
+
+
+def import_equipments_csv(db: Session, content: bytes) -> CsvImportResponse:
+    """
+    備品CSV一括登録処理
+
+    設計書：設計書/サーバー処理（main）/備品管理/備品CSV一括登録
+
+    【処理概要】
+    - 管理者が、CSVファイルから備品を一括登録する。
+    - ファイルの文字コード・ヘッダー・行数を検証し、全行を検証したうえで、誤りが1行もない場合のみ全件を登録する
+      （全件成功または全件失敗）。ファイルサイズの検証はエンドポイント層で行う。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - content (bytes) : CSVファイルの内容（サイズ検証済み）
+
+    【戻り値】
+    - import_response (CsvImportResponse) : 登録件数
+
+    【例外処理】
+    - HTTPException(400) : 文字コードがUTF-8でない・CSVの形式が正しくない・ヘッダー行が正しくない・データ行が0件・
+      データ行が上限（1,000行）を超える場合
+    - CsvImportError : 行ごとの検証エラー（最大100件）が1件以上ある場合（400。1件も登録しない）
+    - HTTPException(409) : 検証後の同時登録により資産番号が重複した場合（1件も登録されない）
+
+    【処理フロー】
+    1. 現在日時の取得
+    2. UTF-8（BOM許容）でデコード
+    3. CSVとして解析
+    4. ヘッダー行と行数の検証
+    5. 各データ行の検証（全行分のエラーを収集。最大100件で打ち切る）
+    6. 既存の資産番号との重複検証
+    7. エラー判定
+    8. 備品の一括登録
+    9. コミット（同時登録による一意制約違反は409）
+    10. 登録件数のログ記録・戻り値の設定
+    """
+    # 1. 現在日時の取得
+    now = get_now()
+
+    # 2. UTF-8（BOM許容）でデコード
+    text = _decode_csv_bytes(content)
+
+    # 3. CSVとして解析
+    parsed_rows = _parse_csv_rows(text)
+
+    # 4. ヘッダー行と行数の検証
+    expected_header = [column[0] for column in _CSV_COLUMNS]
+    header_cells = None
+    if parsed_rows:
+        header_cells = parsed_rows[0][1]
+    if header_cells != expected_header:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_CSV_HEADER_ERROR)
+    data_rows = parsed_rows[1:]
+    if len(data_rows) == 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_CSV_NO_DATA_ERROR)
+    if len(data_rows) > _CSV_MAX_ROWS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_CSV_TOO_MANY_ROWS_ERROR)
+
+    # 5. 各データ行の検証
+    errors: list[CsvRowError] = []
+    valid_rows: list[tuple[int, EquipmentCreateRow]] = []
+    first_row_by_asset_number: dict[str, int] = {}
+    for row_number, cells in data_rows:
+        row, row_errors = _validate_csv_row(row_number, cells)
+        errors.extend(row_errors)
+        if row is None:
+            continue
+        first_row_number = first_row_by_asset_number.get(row.asset_number)
+        if first_row_number is not None:
+            message = f"資産番号がファイル内で重複しています（{first_row_number}行目）"
+            errors.append(CsvRowError(row_number=row_number, column="資産番号", message=message))
+            continue
+        first_row_by_asset_number[row.asset_number] = row_number
+        valid_rows.append((row_number, row))
+
+    # 6. 既存の資産番号との重複検証（5.でエラーがなかった資産番号のみ対象）
+    asset_numbers = [row.asset_number for _, row in valid_rows]
+    existing_asset_numbers = crud.get_existing_asset_numbers(db, asset_numbers)
+    for row_number, row in valid_rows:
+        if row.asset_number in existing_asset_numbers:
+            message = "資産番号が既に登録されています"
+            errors.append(CsvRowError(row_number=row_number, column="資産番号", message=message))
+
+    # 7. エラー判定（行番号の昇順・最大100件）
+    if errors:
+        errors.sort(key=_get_error_row_number)
+        raise CsvImportError(errors[:_CSV_MAX_ERRORS])
+
+    # 8. 備品の一括登録・9. コミット（同時登録による資産番号の重複はDBの一意制約で検出する）
+    rows = [row for _, row in valid_rows]
+    try:
+        imported_count = crud.create_equipments(db, rows, now)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_CSV_CONFLICT_ERROR) from None
+
+    # 10. 登録件数のログ記録（件数のみ。CSVの内容は記録しない）・戻り値の設定
+    logger.info("備品CSV一括登録: 登録件数=%d", imported_count)
+    import_response = CsvImportResponse(imported_count=imported_count)
+    return import_response

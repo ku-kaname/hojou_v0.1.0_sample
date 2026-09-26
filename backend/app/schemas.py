@@ -7,11 +7,12 @@
 ヘルスチェックレスポンスを定義する。日時はJST（+09:00）のISO 8601形式で返却するための型も提供する。
 認証・ユーザー管理の機能群で使うリクエスト・レスポンス（ログイン・パスワード変更・ユーザー登録・編集等）も、
 本ファイルの後半にまとめて定義する。
+備品管理の機能群で使うリクエスト・レスポンス（備品登録・編集・一覧・予約状況・CSV一括登録等）も同様に定義する。
 
-設計書：設計書/スキーマ（schemas）/共通、設計書/スキーマ（schemas）/認証・ユーザー管理
+設計書：設計書/スキーマ（schemas）/共通、設計書/スキーマ（schemas）/認証・ユーザー管理、設計書/スキーマ（schemas）/備品管理
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated, Generic, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
@@ -170,3 +171,105 @@ class UserListQuery(PageQuery):
     keyword: str | None = Field(default=None, max_length=50, description="ユーザーIDまたは氏名の部分一致")
     role: RoleValue | None = Field(default=None, description="ロール（general / admin）")
     is_active: bool | None = Field(default=None, description="省略時は有効・無効の両方")
+
+
+# ---- 備品管理 ----
+
+# 資産番号の形式（半角英数字と-）
+_ASSET_NUMBER_PATTERN = r"^[A-Za-z0-9-]+$"
+
+# 貸出状況（available：貸出可、lent：貸出中）
+AvailabilityValue = Literal["available", "lent"]
+
+# 前後の空白を除去したうえで検証する備品名・分類の型
+EquipmentNameValue = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+CategoryValue = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
+
+
+class EquipmentCreateRequest(BaseModel):
+    """備品登録リクエスト"""
+
+    asset_number: str = Field(min_length=1, max_length=32, pattern=_ASSET_NUMBER_PATTERN, description="資産番号")
+    name: EquipmentNameValue = Field(description="備品名（前後の空白は除去）")
+    category: CategoryValue = Field(description="分類（前後の空白は除去）")
+    description: str = Field(default="", max_length=500, description="説明")
+    location: str = Field(default="", max_length=100, description="保管場所")
+
+
+class EquipmentUpdateRequest(BaseModel):
+    """備品編集リクエスト（全項目を指定する全置換。資産番号は変更できない）"""
+
+    name: EquipmentNameValue = Field(description="備品名（前後の空白は除去）")
+    category: CategoryValue = Field(description="分類（前後の空白は除去）")
+    description: str = Field(max_length=500, description="説明")
+    location: str = Field(max_length=100, description="保管場所")
+    is_active: bool = Field(description="有効フラグ")
+
+
+class EquipmentListQuery(PageQuery):
+    """備品一覧クエリ"""
+
+    keyword: str | None = Field(default=None, max_length=50, description="資産番号または備品名の部分一致")
+    category: str | None = Field(default=None, max_length=50, description="分類（完全一致）")
+    availability: AvailabilityValue | None = Field(default=None, description="貸出状況（available / lent）")
+    include_inactive: bool = Field(default=False, description="無効化済みを含めるか（Trueは管理者のみ）")
+
+
+class EquipmentResponse(BaseModel):
+    """備品レスポンス。貸出状況は貸出中の申請の有無から算出する値（テーブルの列ではない）"""
+
+    id: int = Field(ge=1, description="内部ID")
+    asset_number: str = Field(description="資産番号")
+    name: str = Field(description="備品名")
+    category: str = Field(description="分類")
+    description: str = Field(description="説明")
+    location: str = Field(description="保管場所")
+    is_active: bool = Field(description="有効フラグ")
+    availability: AvailabilityValue = Field(description="貸出状況（available / lent）")
+    current_due_date: date | None = Field(description="現在の返却予定日（貸出中でない場合はNULL）")
+    is_overdue: bool = Field(description="期限超過（貸出中かつ返却予定日が今日より前）")
+    current_borrower_name: str | None = Field(description="現在の借用者氏名（管理者にのみ設定）")
+    created_at: JstDatetime = Field(description="作成日時（JST）")
+    updated_at: JstDatetime = Field(description="更新日時（JST）")
+
+
+class CategoryListResponse(BaseModel):
+    """分類一覧レスポンス"""
+
+    items: list[str] = Field(description="分類（昇順。空の場合は空配列）")
+
+
+class ReservationResponse(BaseModel):
+    """予約期間レスポンス"""
+
+    start_date: date = Field(description="開始日")
+    due_date: date = Field(description="返却予定日")
+    occupied_until: date = Field(description="占有終了日")
+    status: Literal["approved", "lent"] = Field(description="状態（approved：承認済み、lent：貸出中）")
+    borrower_name: str | None = Field(description="借用者氏名（管理者にのみ設定）")
+
+
+class ReservationListResponse(BaseModel):
+    """予約状況レスポンス"""
+
+    items: list[ReservationResponse] = Field(description="予約期間一覧（開始日の昇順。空の場合は空配列）")
+
+
+class CsvImportResponse(BaseModel):
+    """CSV一括登録レスポンス"""
+
+    imported_count: int = Field(ge=1, le=1000, description="登録件数")
+
+
+class CsvRowError(BaseModel):
+    """CSV行別エラー"""
+
+    row_number: int = Field(ge=2, description="ヘッダー行を1行目とするファイル上の行番号")
+    column: str | None = Field(description="列名（特定の列に依らないエラーはNULL）")
+    message: str = Field(description="エラー内容（日本語）")
+
+
+class CsvImportErrorResponse(ErrorResponse):
+    """CSVエラーレスポンス（ステータスコード400）"""
+
+    errors: list[CsvRowError] = Field(description="行別エラー一覧（最大100件。行番号の昇順）")
