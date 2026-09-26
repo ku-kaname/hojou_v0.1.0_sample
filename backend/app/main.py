@@ -10,12 +10,15 @@ FastAPIアプリケーションの組み立てと、HTTPの入口となるエン
 備品管理の機能群として、備品の検索・取得・登録・編集・分類一覧・予約状況・CSV一括登録のエンドポイントを持つ。
 貸出申請・承認の機能群として、貸出申請・申請取消・申請承認・申請却下・申請管理者取消・申請一覧・自分の申請取得のエンドポイントを持つ。
 貸出・返却・履歴の機能群として、貸出・返却・貸出履歴検索・貸出履歴CSV出力・期限超過一覧取得のエンドポイントを持つ。
+通知・日次処理の機能群として、通知一覧取得・通知サマリー取得・通知既読化・通知全件既読化のエンドポイントと、
+起動時の日次処理スケジューラー開始・終了時の停止を持つ。
 
 設計書：設計書/エンドポイント、設計書/サーバー処理（main）/共通/ヘルスチェック、
 設計書/サーバー処理（main）/認証・ユーザー管理/、
 設計書/サーバー処理（main）/備品管理/、
 設計書/サーバー処理（main）/貸出申請・承認/、
-設計書/サーバー処理（main）/貸出・返却・履歴/
+設計書/サーバー処理（main）/貸出・返却・履歴/、
+設計書/日次処理（scheduler）/
 """
 
 import logging
@@ -32,7 +35,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app import services
+from app import scheduler, services
 from app.auth import get_current_active_user, get_current_admin_user, get_current_user, validate_jwt_settings
 from app.database import get_db, get_session_factory
 from app.schemas import (
@@ -56,6 +59,10 @@ from app.schemas import (
     LoanReturnRequest,
     LoginRequest,
     MeResponse,
+    NotificationListQuery,
+    NotificationReadAllResponse,
+    NotificationResponse,
+    NotificationSummaryResponse,
     Page,
     PageQuery,
     PasswordChangeRequest,
@@ -82,12 +89,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     - 起動時にJWT秘密鍵の設定不備を検出し、不備があれば起動を中止する（RuntimeError）。
     - 有効な管理者が1人もいない場合のみ、環境変数の情報で初期管理者を作成する（設計書「初期管理者作成」）。
       環境変数の不備があれば起動を中止する（RuntimeError）。
+    - 初期管理者の作成後に、日次処理のスケジューラーを開始し、終了時に停止する（設計書「日次処理登録」）。
     """
     validate_jwt_settings()
     session_factory = get_session_factory()
     with session_factory() as db:
         services.ensure_initial_admin(db)
-    yield
+    scheduler.start_scheduler()
+    try:
+        yield
+    finally:
+        scheduler.stop_scheduler()
 
 
 def _is_api_docs_enabled() -> bool:
@@ -1327,6 +1339,248 @@ def search_loan_history_endpoint(
 
     # 2. 戻り値を設定
     return loan_history_page
+
+
+@api_router.get("/notifications", response_model=Page[NotificationResponse])
+def list_notifications_endpoint(
+    query: Annotated[NotificationListQuery, Query()],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_active_user)],
+) -> Page[NotificationResponse]:
+    """
+
+    通知一覧取得
+
+
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/通知一覧取得
+
+
+
+    【処理概要】
+
+    - 認証済みユーザーが、自分宛の通知を新しい順に確認する。既読・未読で絞り込める。
+
+
+
+    【パラメータ】
+
+    - query (NotificationListQuery) : 通知一覧クエリ
+
+    - db (Session) : DBセッション
+
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー
+
+
+
+    【戻り値】
+
+    - notification_page (Page[NotificationResponse]) : ページ形式の通知一覧
+
+
+
+    【例外処理】
+
+    - HTTPException(401・403) : 認証・権限エラー
+
+
+
+    【処理フロー】
+
+    1. 通知一覧取得処理（services.list_notifications）
+
+    2. 戻り値を設定
+
+    """
+
+    # 1. 通知一覧取得処理
+
+    notification_page = services.list_notifications(db, authenticated_user, query)
+
+    # 2. 戻り値を設定
+
+    return notification_page
+
+
+@api_router.get("/notifications/summary", response_model=NotificationSummaryResponse)
+def get_notification_summary_endpoint(
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_active_user)],
+) -> NotificationSummaryResponse:
+    """
+
+    通知サマリー取得
+
+
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/通知サマリー取得
+
+
+
+    【処理概要】
+
+    - 認証済みユーザーが、画面上部のバッジ表示用に、未読通知件数と（管理者のみ）承認待ち申請件数を確認する。
+
+
+
+    【パラメータ】
+
+    - db (Session) : DBセッション
+
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー
+
+
+
+    【戻り値】
+
+    - summary (NotificationSummaryResponse) : 未読通知件数と承認待ち申請件数
+
+
+
+    【例外処理】
+
+    - HTTPException(401・403) : 認証・権限エラー
+
+
+
+    【処理フロー】
+
+    1. 通知サマリー取得処理（services.get_notification_summary）
+
+    2. 戻り値を設定
+
+    """
+
+    # 1. 通知サマリー取得処理
+
+    summary = services.get_notification_summary(db, authenticated_user)
+
+    # 2. 戻り値を設定
+
+    return summary
+
+
+@api_router.post("/notifications/read-all", response_model=NotificationReadAllResponse)
+def mark_all_notifications_read_endpoint(
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_active_user)],
+) -> NotificationReadAllResponse:
+    """
+
+    通知全件既読化
+
+
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/通知全件既読化
+
+
+
+    【処理概要】
+
+    - 認証済みユーザーが、自分宛の未読通知をすべて既読にする。
+
+
+
+    【パラメータ】
+
+    - db (Session) : DBセッション
+
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー
+
+
+
+    【戻り値】
+
+    - read_all_response (NotificationReadAllResponse) : 既読へ更新した件数
+
+
+
+    【例外処理】
+
+    - HTTPException(401・403) : 認証・権限エラー
+
+
+
+    【処理フロー】
+
+    1. 通知全件既読化処理（services.mark_all_notifications_read）
+
+    2. 戻り値を設定
+
+    """
+
+    # 1. 通知全件既読化処理
+
+    read_all_response = services.mark_all_notifications_read(db, authenticated_user)
+
+    # 2. 戻り値を設定
+
+    return read_all_response
+
+
+@api_router.post("/notifications/{notification_id}/read", status_code=status.HTTP_204_NO_CONTENT)
+def mark_notification_read_endpoint(
+    notification_id: Annotated[int, Path(ge=1)],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_active_user)],
+) -> Response:
+    """
+
+    通知既読化
+
+
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/通知既読化
+
+
+
+    【処理概要】
+
+    - 認証済みユーザーが、自分宛の通知を既読にする。既に既読でも正常終了する（冪等）。
+
+
+
+    【パラメータ】
+
+    - notification_id (int) : 通知内部ID（1以上）
+
+    - db (Session) : DBセッション
+
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー
+
+
+
+    【戻り値】
+
+    - no_content_response (Response) : 本文なしのレスポンス（204）
+
+
+
+    【例外処理】
+
+    - HTTPException(404) : 存在しない、または他のユーザーの通知
+
+    - HTTPException(401・403) : 認証・権限エラー
+
+
+
+    【処理フロー】
+
+    1. 通知既読化処理（services.mark_notification_read）
+
+    2. レスポンスを設定（本文なし）
+
+    """
+
+    # 1. 通知既読化処理
+
+    services.mark_notification_read(db, authenticated_user, notification_id)
+
+    # 2. レスポンスを設定
+
+    no_content_response = Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    return no_content_response
 
 
 app.include_router(api_router)
