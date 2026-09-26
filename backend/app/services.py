@@ -8,11 +8,13 @@
 備品管理の機能群として、備品の検索・取得・登録・編集・分類一覧・予約状況・CSV一括登録の処理を持つ。
 貸出申請・承認の機能群として、貸出申請・申請取消・申請承認・申請却下・申請管理者取消・申請一覧・自分の申請取得の処理を持つ。
 貸出・返却・履歴の機能群として、貸出・返却・貸出履歴検索・貸出履歴CSV出力・期限超過一覧取得の処理を持つ。
+通知・日次処理の機能群として、通知一覧取得・通知サマリー取得・通知既読化・通知全件既読化・日次処理の処理を持つ。
 
 設計書：設計書/サーバー処理（main）/共通/、設計書/サーバー処理（main）/認証・ユーザー管理/、
 設計書/サーバー処理（main）/備品管理/、
 設計書/サーバー処理（main）/貸出申請・承認/、
-設計書/サーバー処理（main）/貸出・返却・履歴/
+設計書/サーバー処理（main）/貸出・返却・履歴/、
+設計書/日次処理（scheduler）/
 """
 
 import csv
@@ -31,7 +33,7 @@ from sqlalchemy.orm import Session
 from app import crud
 from app.auth import build_credentials_error, create_access_token, hash_password, verify_password
 from app.crud import EquipmentCreateRow
-from app.models import Equipment, LoanRequest, LoanStatus, NotificationType, Role, User
+from app.models import Equipment, LoanRequest, LoanStatus, Notification, NotificationType, Role, User
 from app.schemas import (
     JST,
     AuthenticatedUser,
@@ -53,6 +55,10 @@ from app.schemas import (
     LoanReturnRequest,
     LoginRequest,
     MeResponse,
+    NotificationListQuery,
+    NotificationReadAllResponse,
+    NotificationResponse,
+    NotificationSummaryResponse,
     Page,
     PageQuery,
     PasswordChangeRequest,
@@ -1443,7 +1449,7 @@ def _to_loan_request_response(
         start_date=loan_request.start_date,
         due_date=loan_request.due_date,
         purpose=loan_request.purpose,
-        status=loan_request.status,  # type: ignore[arg-type]
+        status=loan_request.status,
         reason=loan_request.reason,
         return_note=loan_request.return_note,
         requested_at=loan_request.requested_at,
@@ -2227,7 +2233,7 @@ def _to_loan_history_response(
         start_date=loan_request.start_date,
         due_date=loan_request.due_date,
         purpose=loan_request.purpose,
-        status=loan_request.status,  # type: ignore[arg-type]
+        status=loan_request.status,
         lent_at=lent_at,
         returned_at=loan_request.returned_at,
         return_note=loan_request.return_note,
@@ -2440,3 +2446,277 @@ def list_overdue_loan_requests(db: Session, query: PageQuery) -> Page[LoanReques
         page_size=query.page_size,
     )
     return loan_request_page
+
+
+_NOTIFICATION_NOT_FOUND_ERROR = "通知が見つかりません"
+
+_NO_SHOW_CANCEL_REASON = "貸出処理されないまま返却予定日を過ぎたため、自動的に取消しました"
+_UNAPPROVED_CANCEL_REASON = "承認・却下されないまま開始日を過ぎたため、自動的に取消しました"
+
+
+def _to_notification_response(notification: Notification, equipment: Equipment) -> NotificationResponse:
+    """通知・備品を通知レスポンスへ変換する（宛先の内部IDは含めない）"""
+    notification_response = NotificationResponse(
+        id=notification.id,
+        type=notification.type,
+        loan_request_id=notification.loan_request_id,
+        equipment_asset_number=equipment.asset_number,
+        equipment_name=equipment.name,
+        is_read=notification.is_read,
+        created_at=notification.created_at,
+        notified_date=notification.notified_date,
+    )
+    return notification_response
+
+
+def list_notifications(
+    db: Session,
+    authenticated_user: AuthenticatedUser,
+    query: NotificationListQuery,
+) -> Page[NotificationResponse]:
+    """
+    通知一覧取得処理
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/通知一覧取得
+
+    【処理概要】
+    - 認証済みユーザー自身宛の通知を、新しい順にページ単位で取得する。既読・未読で絞り込める。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（宛先は必ず本人）
+    - query (NotificationListQuery) : 通知一覧クエリ（ページ番号・1ページの件数・既読フラグ）
+
+    【戻り値】
+    - notification_page (Page[NotificationResponse]) : ページ形式の通知一覧
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 自分宛の通知を取得
+    2. 通知レスポンスへ変換して、ページ形式で返却
+    """
+    # 1. 自分宛の通知取得
+    rows, total = crud.get_notifications(db, authenticated_user.id, query.is_read, query.page, query.page_size)
+
+    # 2. 通知レスポンスへ変換
+    items = [_to_notification_response(notification, equipment) for notification, equipment in rows]
+    notification_page = Page[NotificationResponse](items=items, total=total, page=query.page, page_size=query.page_size)
+    return notification_page
+
+
+def get_notification_summary(db: Session, authenticated_user: AuthenticatedUser) -> NotificationSummaryResponse:
+    """
+    通知サマリー取得処理
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/通知サマリー取得
+
+    【処理概要】
+    - 画面上部のバッジ表示用に、自分宛の未読通知件数と、（管理者のみ）承認待ち申請件数を取得する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー
+
+    【戻り値】
+    - summary (NotificationSummaryResponse) : 未読通知件数と承認待ち申請件数（一般ユーザーはnull）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 自分宛の未読通知件数を取得
+    2. 管理者の場合のみ、申請中の申請件数を取得
+    3. 通知サマリーレスポンスを返却
+    """
+    # 1. 未読通知件数取得
+    unread_count = crud.count_unread_notifications(db, authenticated_user.id)
+
+    # 2. 承認待ち申請件数取得（管理者のみ）
+    pending_request_count = None
+    if authenticated_user.role == Role.ADMIN.value:
+        pending_request_count = crud.count_loan_requests_by_status(db, LoanStatus.REQUESTED.value)
+
+    # 3. 戻り値を設定
+    summary = NotificationSummaryResponse(unread_count=unread_count, pending_request_count=pending_request_count)
+    return summary
+
+
+def mark_notification_read(db: Session, authenticated_user: AuthenticatedUser, notification_id: int) -> None:
+    """
+    通知既読化処理
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/通知既読化
+
+    【処理概要】
+    - 自分宛の通知を既読にする。既に既読でも正常終了する（冪等）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（宛先は必ず本人）
+    - notification_id (int) : 通知内部ID
+
+    【戻り値】
+    - なし
+
+    【例外処理】
+    - 存在しない、または他のユーザーの通知：HTTPException 404 "通知が見つかりません"（存在有無は判別させない）
+
+    【処理フロー】
+    1. 自分宛の通知を既読へ更新（更新件数0は404）
+    2. コミット
+    """
+    # 1. 既読へ更新
+    updated_count = crud.mark_notification_read(db, notification_id, authenticated_user.id)
+    if updated_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NOTIFICATION_NOT_FOUND_ERROR)
+
+    # 2. コミット
+    db.commit()
+
+
+def mark_all_notifications_read(db: Session, authenticated_user: AuthenticatedUser) -> NotificationReadAllResponse:
+    """
+    通知全件既読化処理
+
+    設計書：設計書/サーバー処理（main）/貸出・返却・履歴/通知全件既読化
+
+    【処理概要】
+    - 自分宛の未読通知をすべて既読にする。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（宛先は必ず本人）
+
+    【戻り値】
+    - read_all_response (NotificationReadAllResponse) : 既読へ更新した件数
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 自分宛の未読通知を全件既読へ更新
+    2. コミット
+    3. 更新件数を返却
+    """
+    # 1. 全件既読へ更新
+    updated_count = crud.mark_all_notifications_read(db, authenticated_user.id)
+
+    # 2. コミット
+    db.commit()
+
+    # 3. 戻り値を設定
+    read_all_response = NotificationReadAllResponse(updated_count=updated_count)
+    return read_all_response
+
+
+def _run_auto_cancel_step(db: Session, now: datetime, today: date, target_status: str, cancel_reason: str) -> int:
+    """
+    自動取消の段階処理（日次処理の内部処理）
+
+    対象の申請を行ロックして取得し、自動取消へ更新して申請者へ取消の通知を生成し、コミットする。
+    取消した件数を返す。
+    """
+    targets = crud.get_auto_cancel_targets_for_update(db, target_status, today)
+    for loan_request in targets:
+        crud.auto_cancel_loan_request(db, loan_request, cancel_reason, now)
+        create_notifications(db, [loan_request.requester_id], NotificationType.CANCELED.value, loan_request.id, today)
+    db.commit()
+    canceled_count = len(targets)
+    return canceled_count
+
+
+def _run_no_show_cancel_step(db: Session, now: datetime, today: date) -> int:
+    """段階A：ノーショー自動取消（返却予定日を過ぎても貸出処理されていない承認済みの申請を取消す）"""
+    canceled_count = _run_auto_cancel_step(db, now, today, LoanStatus.APPROVED.value, _NO_SHOW_CANCEL_REASON)
+    return canceled_count
+
+
+def _run_unapproved_cancel_step(db: Session, now: datetime, today: date) -> int:
+    """段階B：未承認申請の自動取消（開始日を過ぎても承認・却下されていない申請中の申請を取消す）"""
+    canceled_count = _run_auto_cancel_step(db, now, today, LoanStatus.REQUESTED.value, _UNAPPROVED_CANCEL_REASON)
+    return canceled_count
+
+
+def _run_due_soon_step(db: Session, now: datetime, today: date) -> int:
+    """段階C：返却期限の通知（返却予定日が明日の貸出中の申請の借用者へ通知する）"""
+    tomorrow = today + timedelta(days=1)
+    targets = crud.get_lent_loan_requests_due_on(db, tomorrow)
+    for loan_request in targets:
+        create_notifications(db, [loan_request.requester_id], NotificationType.DUE_SOON.value, loan_request.id, today)
+    db.commit()
+    notified_count = len(targets)
+    return notified_count
+
+
+def _run_overdue_step(db: Session, now: datetime, today: date) -> int:
+    """段階D：期限超過の通知（返却予定日を過ぎた貸出中の申請の借用者へ通知する）"""
+    targets = crud.get_overdue_lent_loan_requests(db, today)
+    for loan_request in targets:
+        create_notifications(db, [loan_request.requester_id], NotificationType.OVERDUE.value, loan_request.id, today)
+    db.commit()
+    notified_count = len(targets)
+    return notified_count
+
+
+def run_daily_job(db: Session) -> dict[str, int | list[str]]:
+    """
+    日次処理
+
+    設計書：設計書/日次処理（scheduler）/日次処理実行
+
+    【処理概要】
+    - 貸出・返却の運用に必要な日次の自動処理を、4つの段階に分けて実行する。
+      A. 承認済みで返却予定日を過ぎた申請の自動取消（ノーショー）
+      B. 申請中で開始日を過ぎた申請の自動取消
+      C. 返却予定日が明日の貸出中申請の借用者への通知
+      D. 返却予定日を過ぎた貸出中申請の借用者への通知
+    - 各段階は独立したトランザクションとし、失敗しても次の段階へ進む。同日に再実行しても重複しない。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+
+    【戻り値】
+    - result (dict[str, int | list[str]]) : 各段階の処理件数
+      （キー`no_show_cancel`・`unapproved_cancel`・`due_soon`・`overdue`）と、
+      失敗した段階名の一覧（キー`failed_steps`。失敗がなければ空リスト）。失敗した段階の件数は0
+
+    【例外処理】
+    - 段階の処理中に例外が発生：ロールバックし、例外の種類・段階名をログに記録して（申請の内容・個人情報は記録しない）、
+      失敗した段階として記録し、次の段階へ進む
+
+    【処理フロー】
+    1. 現在日時を取得
+    2. 今日の日付（JST）を取得
+    3. 4つの段階を順に実行（段階ごとにコミット）
+    4. 戻り値を設定
+    """
+    # 1. 現在日時取得
+    now = get_now()
+
+    # 2. 今日の日付取得
+    today = get_today()
+
+    # 3. 4つの段階を実行
+    steps = [
+        ("no_show_cancel", _run_no_show_cancel_step),
+        ("unapproved_cancel", _run_unapproved_cancel_step),
+        ("due_soon", _run_due_soon_step),
+        ("overdue", _run_overdue_step),
+    ]
+    counts: dict[str, int] = {}
+    failed_steps: list[str] = []
+    for step_name, step_function in steps:
+        try:
+            counts[step_name] = step_function(db, now, today)
+        except Exception as error:
+            db.rollback()
+            error_type = type(error).__name__
+            logger.error("日次処理の段階が失敗しました: 段階=%s 例外=%s", step_name, error_type)
+            counts[step_name] = 0
+            failed_steps.append(step_name)
+
+    # 4. 戻り値を設定
+    result: dict[str, int | list[str]] = {**counts, "failed_steps": failed_steps}
+    return result

@@ -4,14 +4,16 @@
 【概要】
 DBへの読み書きだけを担当する。業務判断・commitは行わない（書き込み後は`flush`まで。commitはサービス層が行う）。
 本ファイルは機能群ごとの実装に伴い関数が追加される。
+通知・日次処理の機能群として、通知の一覧・件数・既読更新、状態別の申請件数、自動取消・通知対象の申請取得の処理を持つ。
 
 設計書：設計書/CRUD/
 """
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from typing import Any, cast
 
-from sqlalchemy import ColumnElement, and_, case, func, or_, select
+from sqlalchemy import ColumnElement, CursorResult, and_, case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -1752,3 +1754,358 @@ def get_overdue_loan_requests(
     # 3. 戻り値を設定
     rows_and_total = (rows, total)
     return rows_and_total
+
+
+def get_notifications(
+    db: Session,
+    recipient_id: int,
+    is_read: bool | None,
+    page: int,
+    page_size: int,
+) -> tuple[list[tuple[Notification, Equipment]], int]:
+    """
+    通知一覧取得
+
+    設計書：設計書/CRUD/貸出・返却・履歴/通知一覧取得
+
+    【処理概要】
+    - 宛先（自分）の通知を、貸出申請・備品と結合して新しい順にページ単位で取得する。備品は有効・無効を問わない。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - recipient_id (int) : 宛先（ユーザー内部ID）
+    - is_read (bool | None) : 既読フラグ（Noneの場合は絞り込まない）
+    - page (int) : ページ番号（1以上）
+    - page_size (int) : 1ページの件数（1〜100）
+
+    【戻り値】
+    - rows (list[tuple[Notification, Equipment]]) : 明細一覧（該当なしは空リスト）
+    - total (int) : 総件数
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 条件に合う通知の総件数を取得
+    2. 通知・貸出申請・備品を結合し、新しい順（作成日時・内部IDの降順）でページ単位に取得
+    3. 戻り値を設定
+    """
+    conditions: list[ColumnElement[bool]] = [Notification.recipient_id == recipient_id]
+    if is_read is not None:
+        conditions.append(Notification.is_read == is_read)
+
+    # 1. 総件数取得
+    count_statement = select(func.count()).select_from(Notification).where(*conditions)
+    total = db.execute(count_statement).scalar_one()
+
+    # 2. 一覧取得
+    offset = (page - 1) * page_size
+    list_statement = (
+        select(Notification, Equipment)
+        .join(LoanRequest, LoanRequest.id == Notification.loan_request_id)
+        .join(Equipment, Equipment.id == LoanRequest.equipment_id)
+        .where(*conditions)
+        .order_by(Notification.created_at.desc(), Notification.id.desc())
+        .limit(page_size)
+        .offset(offset)
+    )
+    rows = [(row[0], row[1]) for row in db.execute(list_statement).all()]
+
+    # 3. 戻り値を設定
+    return rows, total
+
+
+def count_unread_notifications(db: Session, recipient_id: int) -> int:
+    """
+    未読通知件数取得
+
+    設計書：設計書/CRUD/貸出・返却・履歴/未読通知件数取得
+
+    【処理概要】
+    - 宛先（自分）の未読通知の件数を取得する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - recipient_id (int) : 宛先（ユーザー内部ID）
+
+    【戻り値】
+    - unread_count (int) : 未読通知件数
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 宛先が一致し未読の通知の件数を取得
+    2. 戻り値を設定
+    """
+    # 1. 未読通知件数取得
+    statement = (
+        select(func.count())
+        .select_from(Notification)
+        .where(Notification.recipient_id == recipient_id, Notification.is_read.is_(False))
+    )
+    unread_count = db.execute(statement).scalar_one()
+
+    # 2. 戻り値を設定
+    return unread_count
+
+
+def count_loan_requests_by_status(db: Session, status: str) -> int:
+    """
+    状態別申請件数取得
+
+    設計書：設計書/CRUD/貸出・返却・履歴/状態別申請件数取得
+
+    【処理概要】
+    - 指定した状態の貸出申請の件数を取得する。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - status (str) : 状態（申請状態の列挙値）
+
+    【戻り値】
+    - request_count (int) : 件数
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 状態が一致する貸出申請の件数を取得
+    2. 戻り値を設定
+    """
+    # 1. 件数取得
+    statement = select(func.count()).select_from(LoanRequest).where(LoanRequest.status == status)
+    request_count = db.execute(statement).scalar_one()
+
+    # 2. 戻り値を設定
+    return request_count
+
+
+def mark_notification_read(db: Session, notification_id: int, recipient_id: int) -> int:
+    """
+    通知既読更新
+
+    設計書：設計書/CRUD/貸出・返却・履歴/通知既読更新
+
+    【処理概要】
+    - 内部IDと宛先が一致する通知を既読へ更新する（既に既読でも既読のまま。flushのみ。コミットは呼び出し元）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - notification_id (int) : 通知内部ID
+    - recipient_id (int) : 宛先（ユーザー内部ID）
+
+    【戻り値】
+    - updated_count (int) : 更新対象の件数（0は該当なし、または他のユーザーの通知）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 内部IDと宛先が一致する通知を既読へ更新し、flushする
+    2. 戻り値を設定
+    """
+    # 1. 既読へ更新
+    statement = (
+        update(Notification)
+        .where(Notification.id == notification_id, Notification.recipient_id == recipient_id)
+        .values(is_read=True)
+    )
+    result = cast(CursorResult[Any], db.execute(statement))
+    db.flush()
+
+    # 2. 戻り値を設定
+    updated_count = result.rowcount
+    return updated_count
+
+
+def mark_all_notifications_read(db: Session, recipient_id: int) -> int:
+    """
+    通知全件既読更新
+
+    設計書：設計書/CRUD/貸出・返却・履歴/通知全件既読更新
+
+    【処理概要】
+    - 宛先（自分）の未読通知をすべて既読へ更新する（flushのみ。コミットは呼び出し元）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - recipient_id (int) : 宛先（ユーザー内部ID）
+
+    【戻り値】
+    - updated_count (int) : 既読へ更新した件数
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 宛先が一致する未読通知を既読へ更新し、flushする
+    2. 戻り値を設定
+    """
+    # 1. 全件既読へ更新
+    statement = (
+        update(Notification)
+        .where(Notification.recipient_id == recipient_id, Notification.is_read.is_(False))
+        .values(is_read=True)
+    )
+    result = cast(CursorResult[Any], db.execute(statement))
+    db.flush()
+
+    # 2. 戻り値を設定
+    updated_count = result.rowcount
+    return updated_count
+
+
+def auto_cancel_loan_request(
+    db: Session,
+    loan_request: LoanRequest,
+    cancel_reason: str,
+    now: datetime,
+) -> LoanRequest:
+    """
+    貸出申請自動取消
+
+    設計書：設計書/CRUD/貸出・返却・履歴/貸出申請自動取消
+
+    【処理概要】
+    - 貸出申請を、システムによる自動取消へ更新する（取消した者は空。flushのみ。コミットは呼び出し元）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - loan_request (LoanRequest) : 貸出申請情報（行ロック取得済み）
+    - cancel_reason (str) : 取消理由
+    - now (datetime) : 現在日時（UTC）
+
+    【戻り値】
+    - loan_request (LoanRequest) : 更新した貸出申請
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 状態を取消、取消した者を空、取消日時・理由を設定して、flushする
+    2. 戻り値を設定
+    """
+    # 1. 貸出申請の更新
+    loan_request.status = LoanStatus.CANCELED.value
+    loan_request.canceled_by = None
+    loan_request.canceled_at = now
+    loan_request.reason = cancel_reason
+    db.flush()
+
+    # 2. 戻り値を設定
+    return loan_request
+
+
+def get_auto_cancel_targets_for_update(db: Session, status: str, today: date) -> list[LoanRequest]:
+    """
+    自動取消対象申請ロック取得
+
+    設計書：設計書/CRUD/貸出・返却・履歴/自動取消対象申請ロック取得
+
+    【処理概要】
+    - 自動取消の対象となる貸出申請を、行ロックして取得する。
+      承認済みは返却予定日が今日より前、申請中は開始日が今日より前のものが対象。それ以外の状態は対象なし。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - status (str) : 状態（承認済みまたは申請中）
+    - today (date) : 今日（JSTの暦日）
+
+    【戻り値】
+    - loan_requests (list[LoanRequest]) : 対象の貸出申請一覧（該当なしは空リスト。内部IDの昇順）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 状態に応じた条件で、内部IDの昇順に行ロックして取得
+    2. 戻り値を設定
+    """
+    # 1. 対象取得
+    if status == LoanStatus.APPROVED.value:
+        target_condition = LoanRequest.due_date < today
+    elif status == LoanStatus.REQUESTED.value:
+        target_condition = LoanRequest.start_date < today
+    else:
+        return []
+    statement = (
+        select(LoanRequest)
+        .where(LoanRequest.status == status, target_condition)
+        .order_by(LoanRequest.id.asc())
+        .with_for_update()
+    )
+    loan_requests = list(db.execute(statement).scalars().all())
+
+    # 2. 戻り値を設定
+    return loan_requests
+
+
+def get_overdue_lent_loan_requests(db: Session, today: date) -> list[LoanRequest]:
+    """
+    期限超過貸出中申請取得
+
+    設計書：設計書/CRUD/貸出・返却・履歴/期限超過貸出中申請取得
+
+    【処理概要】
+    - 返却予定日を過ぎても返却されていない貸出中の貸出申請を取得する（通知の宛先の特定に使う）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - today (date) : 今日（JSTの暦日）
+
+    【戻り値】
+    - loan_requests (list[LoanRequest]) : 貸出申請一覧（該当なしは空リスト。内部IDの昇順）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 貸出中で返却予定日が今日より前の貸出申請を、内部IDの昇順に取得
+    2. 戻り値を設定
+    """
+    # 1. 期限超過の貸出中申請取得
+    statement = (
+        select(LoanRequest)
+        .where(LoanRequest.status == LoanStatus.LENT.value, LoanRequest.due_date < today)
+        .order_by(LoanRequest.id.asc())
+    )
+    loan_requests = list(db.execute(statement).scalars().all())
+
+    # 2. 戻り値を設定
+    return loan_requests
+
+
+def get_lent_loan_requests_due_on(db: Session, due_date: date) -> list[LoanRequest]:
+    """
+    貸出中申請返却予定日指定取得
+
+    設計書：設計書/CRUD/貸出・返却・履歴/貸出中申請返却予定日指定取得
+
+    【処理概要】
+    - 返却予定日が指定日である貸出中の貸出申請を取得する（返却期限が近いことの通知の宛先の特定に使う）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - due_date (date) : 返却予定日
+
+    【戻り値】
+    - loan_requests (list[LoanRequest]) : 貸出申請一覧（該当なしは空リスト。内部IDの昇順）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 貸出中で返却予定日が一致する貸出申請を、内部IDの昇順に取得
+    2. 戻り値を設定
+    """
+    # 1. 返却予定日指定の貸出中申請取得
+    statement = (
+        select(LoanRequest)
+        .where(LoanRequest.status == LoanStatus.LENT.value, LoanRequest.due_date == due_date)
+        .order_by(LoanRequest.id.asc())
+    )
+    loan_requests = list(db.execute(statement).scalars().all())
+
+    # 2. 戻り値を設定
+    return loan_requests
