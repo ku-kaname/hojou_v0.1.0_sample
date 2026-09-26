@@ -159,8 +159,7 @@ def test_login_locks_after_five_failures_and_unlocks_after_expiry(db, client):
 
 def test_login_validation_error_422(client):
     """
-    【結合テスト項番4】異常系 - 入力チェックエラー（ログインIDが短い・使用不可の文字・パスワードが空
-      ）
+    【結合テスト項番4】異常系 - 入力チェックエラー（ログインIDが短い・使用不可の文字・パスワードが空）
     前提条件：
     ・テスト用DB起動済み
     入力値：
