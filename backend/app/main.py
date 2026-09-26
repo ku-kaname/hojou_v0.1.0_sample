@@ -5,8 +5,11 @@
 FastAPIアプリケーションの組み立てと、HTTPの入口となるエンドポイントを定義する。
 すべてのAPIは`/api`配下に配置する。機能群ごとのエンドポイントは、実装の進行に伴い本ファイルへ追加する。
 共通部分として、アプリの起動時検証・想定外エラーの共通応答・ヘルスチェックを持つ。
+認証・ユーザー管理の機能群として、ログイン・ログアウト・パスワード変更・ユーザー管理のエンドポイントと、
+起動時の初期管理者作成を持つ。
 
-設計書：設計書/エンドポイント、設計書/サーバー処理（main）/共通/ヘルスチェック
+設計書：設計書/エンドポイント、設計書/サーバー処理（main）/共通/ヘルスチェック、
+設計書/サーバー処理（main）/認証・ユーザー管理/
 """
 
 import logging
@@ -15,7 +18,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import text
@@ -23,9 +26,23 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.auth import validate_jwt_settings
-from app.database import get_db
-from app.schemas import HealthResponse
+from app import services
+from app.auth import get_current_admin_user, get_current_user, validate_jwt_settings
+from app.database import get_db, get_session_factory
+from app.schemas import (
+    AuthenticatedUser,
+    HealthResponse,
+    LoginRequest,
+    MeResponse,
+    Page,
+    PasswordChangeRequest,
+    PasswordResetRequest,
+    TokenResponse,
+    UserCreateRequest,
+    UserListQuery,
+    UserResponse,
+    UserUpdateRequest,
+)
 
 logger = logging.getLogger("app")
 
@@ -39,8 +56,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     【処理概要】
     - 起動時にJWT秘密鍵の設定不備を検出し、不備があれば起動を中止する（RuntimeError）。
+    - 有効な管理者が1人もいない場合のみ、環境変数の情報で初期管理者を作成する（設計書「初期管理者作成」）。
+      環境変数の不備があれば起動を中止する（RuntimeError）。
     """
     validate_jwt_settings()
+    session_factory = get_session_factory()
+    with session_factory() as db:
+        services.ensure_initial_admin(db)
     yield
 
 
@@ -135,6 +157,344 @@ def health_check(db: Annotated[Session, Depends(get_db)]) -> HealthResponse:
     # 2. 戻り値を設定
     health_response = HealthResponse(status="ok")
     return health_response
+
+
+@api_router.post("/auth/login", response_model=TokenResponse)
+def login(request: LoginRequest, db: Annotated[Session, Depends(get_db)]) -> TokenResponse:
+    """
+    ログイン
+
+    設計書：設計書/サーバー処理（main）/認証・ユーザー管理/ログイン
+
+    【処理概要】
+    - ユーザーID・パスワードで認証し、アクセストークンを発行する。認証は不要。
+    - 失敗の原因（不在・無効・ロック中・不一致）によらず同一の401を返す。
+
+    【パラメータ】
+    - request (LoginRequest) : ログインリクエスト
+    - db (Session) : DBセッション
+
+    【戻り値】
+    - token_response (TokenResponse) : アクセストークン・"bearer"・初回パスワード変更要否
+
+    【例外処理】
+    - HTTPException(401) : 認証失敗（"ユーザーIDまたはパスワードが正しくありません"）
+
+    【処理フロー】
+    1. ログイン認証（services.login_user）
+    2. 認証失敗の応答
+    3. 戻り値を設定
+    """
+    # 1. ログイン認証
+    token_response = services.login_user(db, request)
+
+    # 2. 認証失敗の応答
+    if token_response is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="ユーザーIDまたはパスワードが正しくありません",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 3. 戻り値を設定
+    return token_response
+
+
+@api_router.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+def logout(
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_user)],
+) -> Response:
+    """
+    ログアウト
+
+    設計書：設計書/サーバー処理（main）/認証・ユーザー管理/ログアウト
+
+    【処理概要】
+    - ログイン状態を終了し、発行済みトークンをすべて失効させる（初期パスワード未変更でも可）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー
+
+    【戻り値】
+    - なし（204。レスポンスボディなし）
+
+    【例外処理】
+    - HTTPException(401) : 認証エラー（認証・認可層）
+
+    【処理フロー】
+    1. ログアウト処理（services.logout_user）
+    2. 戻り値を設定
+    """
+    # 1. ログアウト処理
+    services.logout_user(db, authenticated_user)
+
+    # 2. 戻り値を設定
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@api_router.get("/users/me", response_model=MeResponse)
+def get_me(
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_user)],
+) -> MeResponse:
+    """
+    自分の情報取得
+
+    設計書：設計書/サーバー処理（main）/認証・ユーザー管理/自分の情報取得
+
+    【処理概要】
+    - ログイン中のユーザー自身の情報を返却する（画面の表示制御用。初期パスワード未変更でも可）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー
+
+    【戻り値】
+    - me_response (MeResponse) : 自分のユーザー情報
+
+    【例外処理】
+    - HTTPException(401) : 認証エラー・ユーザーが取得できない場合
+
+    【処理フロー】
+    1. 自分の情報取得（services.get_my_profile）
+    2. 戻り値を設定
+    """
+    # 1. 自分の情報取得
+    me_response = services.get_my_profile(db, authenticated_user)
+
+    # 2. 戻り値を設定
+    return me_response
+
+
+@api_router.put("/users/me/password", response_model=TokenResponse)
+def change_password(
+    request: PasswordChangeRequest,
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_user)],
+) -> TokenResponse:
+    """
+    パスワード変更
+
+    設計書：設計書/サーバー処理（main）/認証・ユーザー管理/パスワード変更
+
+    【処理概要】
+    - ログイン中のユーザーが自分のパスワードを変更する（初回パスワード変更を含む）。
+    - 発行済みトークンを失効させ、新しいトークンを返却する。
+
+    【パラメータ】
+    - request (PasswordChangeRequest) : パスワード変更リクエスト
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー
+
+    【戻り値】
+    - token_response (TokenResponse) : 新しいトークン
+
+    【例外処理】
+    - HTTPException(400) : 現在のパスワードの誤り・ロック中・新旧パスワードが同一
+    - HTTPException(401) : 認証エラー
+
+    【処理フロー】
+    1. パスワード変更処理（services.change_own_password）
+    2. 戻り値を設定
+    """
+    # 1. パスワード変更処理
+    token_response = services.change_own_password(db, authenticated_user, request)
+
+    # 2. 戻り値を設定
+    return token_response
+
+
+@api_router.post("/admin/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def create_user_endpoint(
+    request: UserCreateRequest,
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> UserResponse:
+    """
+    ユーザー登録
+
+    設計書：設計書/サーバー処理（main）/認証・ユーザー管理/ユーザー登録
+
+    【処理概要】
+    - 管理者が新しいユーザーを登録する。初回ログイン時にパスワード変更を強制する。
+
+    【パラメータ】
+    - request (UserCreateRequest) : ユーザー登録リクエスト
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - user_response (UserResponse) : 登録したユーザー（201）
+
+    【例外処理】
+    - HTTPException(409) : ユーザーIDの重複
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. ユーザー登録処理（services.register_user）
+    2. 戻り値を設定
+    """
+    # 1. ユーザー登録処理
+    user_response = services.register_user(db, request)
+
+    # 2. 戻り値を設定
+    return user_response
+
+
+@api_router.get("/admin/users", response_model=Page[UserResponse])
+def list_users(
+    query: Annotated[UserListQuery, Query()],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> Page[UserResponse]:
+    """
+    ユーザー一覧取得
+
+    設計書：設計書/サーバー処理（main）/認証・ユーザー管理/ユーザー一覧取得
+
+    【処理概要】
+    - 管理者が、無効化済みを含むユーザーを検索・一覧表示する。
+
+    【パラメータ】
+    - query (UserListQuery) : ユーザー一覧クエリ
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - page_response (Page[UserResponse]) : ページ形式のユーザー一覧
+
+    【例外処理】
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. ユーザー一覧取得処理（services.list_users_admin）
+    2. 戻り値を設定
+    """
+    # 1. ユーザー一覧取得処理
+    page_response = services.list_users_admin(db, query)
+
+    # 2. 戻り値を設定
+    return page_response
+
+
+@api_router.get("/admin/users/{user_id}", response_model=UserResponse)
+def get_user_endpoint(
+    user_id: Annotated[int, Path(ge=1)],
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> UserResponse:
+    """
+    ユーザー取得
+
+    設計書：設計書/サーバー処理（main）/認証・ユーザー管理/ユーザー取得
+
+    【処理概要】
+    - 管理者が、ユーザー1件の詳細を取得する（編集画面の初期表示用）。
+
+    【パラメータ】
+    - user_id (int) : ユーザー内部ID（1以上）
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - user_response (UserResponse) : ユーザー
+
+    【例外処理】
+    - HTTPException(404) : ユーザーが存在しない場合
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. ユーザー取得処理（services.get_user_admin）
+    2. 戻り値を設定
+    """
+    # 1. ユーザー取得処理
+    user_response = services.get_user_admin(db, user_id)
+
+    # 2. 戻り値を設定
+    return user_response
+
+
+@api_router.put("/admin/users/{user_id}", response_model=UserResponse)
+def update_user_endpoint(
+    user_id: Annotated[int, Path(ge=1)],
+    request: UserUpdateRequest,
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> UserResponse:
+    """
+    ユーザー編集
+
+    設計書：設計書/サーバー処理（main）/認証・ユーザー管理/ユーザー編集
+
+    【処理概要】
+    - 管理者がユーザーの氏名・所属・ロール・有効フラグを更新する。
+    - 有効な管理者が0人にならないことを保証し、無効化時は未貸出の申請を自動取消する。
+
+    【パラメータ】
+    - user_id (int) : ユーザー内部ID（1以上）
+    - request (UserUpdateRequest) : ユーザー編集リクエスト
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - user_response (UserResponse) : 更新後のユーザー
+
+    【例外処理】
+    - HTTPException(400) : 最後の有効な管理者の無効化・ロール変更、貸出中の申請があるユーザーの無効化
+    - HTTPException(404) : ユーザーが存在しない場合
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. ユーザー編集処理（services.update_user_admin）
+    2. 戻り値を設定
+    """
+    # 1. ユーザー編集処理
+    user_response = services.update_user_admin(db, user_id, request)
+
+    # 2. 戻り値を設定
+    return user_response
+
+
+@api_router.post("/admin/users/{user_id}/reset-password", status_code=status.HTTP_204_NO_CONTENT)
+def reset_user_password(
+    user_id: Annotated[int, Path(ge=1)],
+    request: PasswordResetRequest,
+    db: Annotated[Session, Depends(get_db)],
+    authenticated_user: Annotated[AuthenticatedUser, Depends(get_current_admin_user)],
+) -> Response:
+    """
+    パスワード初期化
+
+    設計書：設計書/サーバー処理（main）/認証・ユーザー管理/パスワード初期化
+
+    【処理概要】
+    - 管理者が、パスワードを忘れたユーザーのパスワードを初期パスワードに再設定する。
+    - 初回パスワード変更を要求し、発行済みトークンの失効とロック解除を行う。
+
+    【パラメータ】
+    - user_id (int) : ユーザー内部ID（1以上）
+    - request (PasswordResetRequest) : パスワード初期化リクエスト
+    - db (Session) : DBセッション
+    - authenticated_user (AuthenticatedUser) : 認証済みユーザー（有効な管理者）
+
+    【戻り値】
+    - なし（204。レスポンスボディなし）
+
+    【例外処理】
+    - HTTPException(404) : ユーザーが存在しない場合
+    - HTTPException(401・403) : 認証・権限エラー
+
+    【処理フロー】
+    1. パスワード初期化処理（services.reset_password_admin）
+    2. 戻り値を設定
+    """
+    # 1. パスワード初期化処理
+    services.reset_password_admin(db, user_id, request)
+
+    # 2. 戻り値を設定
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 app.include_router(api_router)

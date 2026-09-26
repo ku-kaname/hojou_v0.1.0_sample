@@ -192,7 +192,7 @@ def verify_password(plain_password: str, password_hash: str | None) -> bool:
     return is_matched
 
 
-def _build_credentials_error() -> HTTPException:
+def build_credentials_error() -> HTTPException:
     """認証失敗（401）の例外を作成する。失効・無効化・未登録を区別させないため、常に同一の内容とする"""
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -239,7 +239,7 @@ def get_current_user(
     # 1. Bearerトークンの検証（未指定も他の認証失敗と同一の401とする）
     if token is None:
         _log_auth_failure(None, "トークン未指定")
-        raise _build_credentials_error()
+        raise build_credentials_error()
     secret_key = _get_jwt_secret_key()
     try:
         payload = jwt.decode(
@@ -250,17 +250,17 @@ def get_current_user(
         )
     except jwt.PyJWTError:
         _log_auth_failure(None, "トークン不正または期限切れ")
-        raise _build_credentials_error() from None
+        raise build_credentials_error() from None
     try:
         user_id = int(payload["sub"])
         token_generation = payload["gen"]
     except (KeyError, TypeError, ValueError):
         _log_auth_failure(None, "クレーム不正")
-        raise _build_credentials_error() from None
+        raise build_credentials_error() from None
     # bool（True/False）は整数として扱わない
     if not isinstance(token_generation, int) or isinstance(token_generation, bool):
         _log_auth_failure(user_id, "クレーム不正")
-        raise _build_credentials_error()
+        raise build_credentials_error()
 
     # 2. 登録ユーザー取得
     user = crud.get_user_by_id(db, user_id)
@@ -268,13 +268,13 @@ def get_current_user(
     # 3. ユーザー状態の検証
     if user is None:
         _log_auth_failure(user_id, "ユーザー未登録")
-        raise _build_credentials_error()
+        raise build_credentials_error()
     if not user.is_active:
         _log_auth_failure(user_id, "ユーザー無効")
-        raise _build_credentials_error()
+        raise build_credentials_error()
     if user.token_generation != token_generation:
         _log_auth_failure(user_id, "トークン世代不一致")
-        raise _build_credentials_error()
+        raise build_credentials_error()
 
     # 4. 戻り値を設定
     authenticated_user = AuthenticatedUser.model_validate(user)

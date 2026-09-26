@@ -5,15 +5,17 @@
 全機能から共通で使うリクエスト・レスポンスの型定義。
 エラーレスポンス・ページング条件・ページング結果・自分のユーザー情報レスポンス・認証済みユーザー・
 ヘルスチェックレスポンスを定義する。日時はJST（+09:00）のISO 8601形式で返却するための型も提供する。
+認証・ユーザー管理の機能群で使うリクエスト・レスポンス（ログイン・パスワード変更・ユーザー登録・編集等）も、
+本ファイルの後半にまとめて定義する。
 
-設計書：設計書/スキーマ（schemas）/共通
+設計書：設計書/スキーマ（schemas）/共通、設計書/スキーマ（schemas）/認証・ユーザー管理
 """
 
 from datetime import UTC, datetime
-from typing import Annotated, Generic, TypeVar
+from typing import Annotated, Generic, Literal, TypeVar
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, StringConstraints
 
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -84,3 +86,87 @@ class HealthResponse(BaseModel):
     """ヘルスチェックレスポンス"""
 
     status: str = Field(default="ok", description="固定値ok")
+
+
+# ---- 認証・ユーザー管理 ----
+
+# ユーザーIDの形式（半角英数字と_・-）
+_LOGIN_ID_PATTERN = r"^[A-Za-z0-9_-]+$"
+
+# ロール（models.Roleの値と一致させる）
+RoleValue = Literal["general", "admin"]
+
+# 前後の空白を除去したうえで1〜50桁を検証する氏名の型
+NameValue = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
+
+
+class LoginRequest(BaseModel):
+    """ログインリクエスト"""
+
+    login_id: str = Field(min_length=3, max_length=32, pattern=_LOGIN_ID_PATTERN, description="ユーザーID")
+    # 最大桁は、Argon2idの過大入力による負荷を避けるため
+    password: str = Field(min_length=1, max_length=128, description="パスワード")
+
+
+class TokenResponse(BaseModel):
+    """トークン発行レスポンス"""
+
+    access_token: str = Field(description="発行したJWT")
+    token_type: str = Field(default="bearer", description="固定値bearer")
+    must_change_password: bool = Field(description="真の場合、画面はパスワード変更画面へ誘導する")
+
+
+class PasswordChangeRequest(BaseModel):
+    """パスワード変更リクエスト。現在と同一の新パスワードは業務ルールで検証する"""
+
+    current_password: str = Field(min_length=1, max_length=128, description="現在のパスワード")
+    new_password: str = Field(min_length=8, max_length=128, description="新しいパスワード")
+
+
+class UserCreateRequest(BaseModel):
+    """ユーザー登録リクエスト"""
+
+    login_id: str = Field(min_length=3, max_length=32, pattern=_LOGIN_ID_PATTERN, description="ユーザーID")
+    name: NameValue = Field(description="氏名（前後の空白は除去）")
+    department: str = Field(default="", max_length=50, description="所属")
+    role: RoleValue = Field(description="ロール（general / admin）")
+    initial_password: str = Field(min_length=8, max_length=128, description="初期パスワード")
+
+
+class UserUpdateRequest(BaseModel):
+    """ユーザー編集リクエスト（全項目を指定する全置換）"""
+
+    name: NameValue = Field(description="氏名（前後の空白は除去）")
+    department: str = Field(max_length=50, description="所属")
+    role: RoleValue = Field(description="ロール（general / admin）")
+    is_active: bool = Field(description="有効フラグ")
+
+
+class PasswordResetRequest(BaseModel):
+    """パスワード初期化リクエスト"""
+
+    new_password: str = Field(min_length=8, max_length=128, description="初期パスワード")
+
+
+class UserResponse(BaseModel):
+    """ユーザーレスポンス。パスワードハッシュ・連続認証失敗回数・ロック解除日時・トークン世代は含めない"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int = Field(ge=1, description="内部ID")
+    login_id: str = Field(description="ユーザーID")
+    name: str = Field(description="氏名")
+    department: str = Field(description="所属")
+    role: str = Field(description="ロール（general / admin）")
+    is_active: bool = Field(description="有効フラグ")
+    must_change_password: bool = Field(description="初回パスワード変更要否")
+    created_at: JstDatetime = Field(description="作成日時（JST）")
+    updated_at: JstDatetime = Field(description="更新日時（JST）")
+
+
+class UserListQuery(PageQuery):
+    """ユーザー一覧クエリ"""
+
+    keyword: str | None = Field(default=None, max_length=50, description="ユーザーIDまたは氏名の部分一致")
+    role: RoleValue | None = Field(default=None, description="ロール（general / admin）")
+    is_active: bool | None = Field(default=None, description="省略時は有効・無効の両方")
