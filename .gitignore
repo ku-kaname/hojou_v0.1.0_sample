@@ -1,2 +1,25 @@
-.agents/
-.claude/
+# 秘密情報（実際の.envはコミットしない）
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# その他
+*.log
+.DS_Store
+Thumbs.db
