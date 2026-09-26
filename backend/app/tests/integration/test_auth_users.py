@@ -257,6 +257,17 @@ def test_register_user_duplicate_login_id_409_including_inactive(db, client):
         assert response.json() == {"detail": "このユーザーIDは既に登録されています"}
 
 
+def test_register_user_concurrent_duplicate_login_id_409(db, client, monkeypatch):
+    admin = _make_user(db, "admin1", role="admin")
+    headers = _headers(admin)
+    # 事前確認をすり抜けた同時登録を再現するため、重複確認が「なし」を返すようにする
+    monkeypatch.setattr(crud, "get_user_by_login_id", lambda _db, _login_id, _for_update: None)
+    body = {"login_id": "admin1", "name": "x", "role": "general", "initial_password": "InitPass1234"}
+    response = client.post("/api/admin/users", json=body, headers=headers)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "このユーザーIDは既に登録されています"}
+
+
 def test_register_user_validation_error_422(db, client):
     admin = _make_user(db, "admin1", role="admin")
     headers = _headers(admin)
