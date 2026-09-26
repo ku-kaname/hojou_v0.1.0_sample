@@ -66,7 +66,8 @@ export function HomePage() {
       await markNotificationRead(notification.id)
       reloadNotifications()
     } catch (error) {
-      setActionError(toErrorMessage(error))
+      const message = toErrorMessage(error)
+      setActionError(message)
     }
   }
 
@@ -76,7 +77,8 @@ export function HomePage() {
       await markAllNotificationsRead()
       reloadNotifications()
     } catch (error) {
-      setActionError(toErrorMessage(error))
+      const message = toErrorMessage(error)
+      setActionError(message)
     }
   }
 

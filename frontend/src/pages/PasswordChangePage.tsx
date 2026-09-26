@@ -43,7 +43,8 @@ export function PasswordChangePage() {
       await replaceToken(token.access_token)
       navigate('/', { replace: true })
     } catch (error) {
-      setErrorMessage(toErrorMessage(error))
+      const message = toErrorMessage(error)
+      setErrorMessage(message)
       setSubmitting(false)
     }
   }

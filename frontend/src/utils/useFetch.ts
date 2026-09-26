@@ -42,7 +42,8 @@ export function useFetch<T>(loader: () => Promise<T>): FetchResult<T> {
         }
       } catch (error) {
         if (!cancelled) {
-          setSettled({ loader, token, data: null, error: toErrorMessage(error) })
+          const message = toErrorMessage(error)
+          setSettled({ loader, token, data: null, error: message })
         }
       }
     }

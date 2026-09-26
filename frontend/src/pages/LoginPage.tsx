@@ -46,7 +46,8 @@ export function LoginPage() {
       const next = me.must_change_password ? '/password-change' : destination
       navigate(next, { replace: true })
     } catch (error) {
-      setErrorMessage(toErrorMessage(error))
+      const message = toErrorMessage(error)
+      setErrorMessage(message)
       setSubmitting(false)
     }
   }

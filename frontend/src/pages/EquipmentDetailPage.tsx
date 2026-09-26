@@ -49,7 +49,8 @@ export function EquipmentDetailPage() {
   }, [equipmentId])
   const reservations = useFetch(loadReservations)
 
-  const today = toDateInputValue(new Date())
+  const now = new Date()
+  const today = toDateInputValue(now)
   const [startDate, setStartDate] = useState(today)
   const [dueDate, setDueDate] = useState(today)
   const [purpose, setPurpose] = useState('')
@@ -67,6 +68,7 @@ export function EquipmentDetailPage() {
       setErrorMessage(validationMessage)
       return
     }
+    const trimmedPurpose = purpose.trim()
     setSubmitting(true)
     setErrorMessage(null)
     try {
@@ -74,14 +76,15 @@ export function EquipmentDetailPage() {
         equipment_id: equipmentId,
         start_date: startDate,
         due_date: dueDate,
-        purpose: purpose.trim(),
+        purpose: trimmedPurpose,
       })
       setCreated(response)
       setPurpose('')
       reservations.reload()
       equipment.reload()
     } catch (error) {
-      setErrorMessage(toErrorMessage(error))
+      const message = toErrorMessage(error)
+      setErrorMessage(message)
     } finally {
       setSubmitting(false)
     }

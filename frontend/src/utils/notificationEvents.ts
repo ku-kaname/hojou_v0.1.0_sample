@@ -9,7 +9,8 @@ const NOTIFICATIONS_CHANGED_EVENT = 'hojou:notifications-changed'
 
 /** 通知の状態が変わったことを知らせる（既読化した後に呼ぶ） */
 export function notifyNotificationsChanged(): void {
-  window.dispatchEvent(new Event(NOTIFICATIONS_CHANGED_EVENT))
+  const changedEvent = new Event(NOTIFICATIONS_CHANGED_EVENT)
+  window.dispatchEvent(changedEvent)
 }
 
 /** 通知の変更を受け取る処理を登録する。戻り値の関数を呼ぶと登録を解除する */

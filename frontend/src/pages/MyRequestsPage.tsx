@@ -53,7 +53,8 @@ export function MyRequestsPage() {
       await cancelLoanRequest(request.id)
       requests.reload()
     } catch (error) {
-      setActionError(toErrorMessage(error))
+      const message = toErrorMessage(error)
+      setActionError(message)
     } finally {
       setCancelingId(null)
     }

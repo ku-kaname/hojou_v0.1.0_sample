@@ -50,10 +50,11 @@ export function buildQueryString(params?: QueryParams): string {
     if (value === undefined || value === null || value === '') {
       continue
     }
-    search.set(key, String(value))
+    const text = String(value)
+    search.set(key, text)
   }
-  const text = search.toString()
-  return text === '' ? '' : `?${text}`
+  const queryText = search.toString()
+  return queryText === '' ? '' : `?${queryText}`
 }
 
 /** エラーレスポンスの本文から、画面表示用メッセージと行エラーを取り出す */
@@ -195,7 +196,8 @@ export async function apiDownload(
 ): Promise<DownloadResult> {
   const response = await send(path, { query })
   const blob = await response.blob()
-  const filename = extractFilename(response.headers.get('Content-Disposition'), fallbackFilename)
+  const disposition = response.headers.get('Content-Disposition')
+  const filename = extractFilename(disposition, fallbackFilename)
   return { blob, filename }
 }
 
