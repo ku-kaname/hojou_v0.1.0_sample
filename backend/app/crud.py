@@ -11,7 +11,7 @@ DBへの読み書きだけを担当する。業務判断・commitは行わない
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -1135,3 +1135,349 @@ def get_reservations(db: Session, equipment_id: int, base_date: date) -> list[tu
     # 2. 戻り値を設定
     reservations = [(loan, borrower_name) for loan, borrower_name in rows]
     return reservations
+
+
+# ---- 貸出申請・承認 ----
+
+
+def count_overlapping_reservations(
+    db: Session,
+    equipment_id: int,
+    start_date: date,
+    due_date: date,
+    base_date: date,
+    exclude_loan_request_id: int | None = None,
+) -> int:
+    """
+    占有期間重複件数取得
+
+    設計書：設計書/CRUD/貸出申請・承認/占有期間重複件数取得
+
+    【処理概要】
+    - 指定した備品・期間に重複する、承認済み・貸出中の申請の件数を取得する（二重貸出の防止）。
+    - 貸出申請・申請承認から利用される。呼び出し元が備品を行ロックしたうえで呼び出すこと。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - equipment_id (int) : 備品内部ID（1以上）
+    - start_date (date) : 判定対象の期間の開始日（両端を含む）
+    - due_date (date) : 判定対象の期間の終了日（両端を含む）
+    - base_date (date) : 基準日（JST今日。貸出中の占有終了日の算出に使う）
+    - exclude_loan_request_id (int | None) : 除外する貸出申請内部ID（承認時に自分自身を除外する。省略時は除外しない）
+
+    【戻り値】
+    - overlap_count (int) : 重複件数（0以上）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. loan_requestテーブルから、備品が一致し状態が承認済み・貸出中で占有期間が重なる申請を数える
+       - 占有終了日は、承認済みは返却予定日、貸出中は返却予定日と基準日のうち遅い方（期限超過中は今日まで占有）
+    2. 戻り値を設定
+    """
+    # 1. 重複件数取得
+    occupied_statuses = [LoanStatus.APPROVED.value, LoanStatus.LENT.value]
+    lent_end_date = func.greatest(LoanRequest.due_date, base_date)
+    occupied_end_date = case((LoanRequest.status == LoanStatus.LENT.value, lent_end_date), else_=LoanRequest.due_date)
+    conditions = [
+        LoanRequest.equipment_id == equipment_id,
+        LoanRequest.status.in_(occupied_statuses),
+        LoanRequest.start_date <= due_date,
+        occupied_end_date >= start_date,
+    ]
+    if exclude_loan_request_id is not None:
+        conditions.append(LoanRequest.id != exclude_loan_request_id)
+    statement = select(func.count(LoanRequest.id)).where(*conditions)
+    overlap_count = db.execute(statement).scalar_one()
+
+    # 2. 戻り値を設定
+    return overlap_count
+
+
+def get_loan_requests(
+    db: Session,
+    requester_id: int | None,
+    status: str | None,
+    newest_first: bool,
+    page: int,
+    page_size: int,
+) -> tuple[list[tuple[LoanRequest, Equipment, User]], int]:
+    """
+    貸出申請一覧取得
+
+    設計書：設計書/CRUD/貸出申請・承認/貸出申請一覧取得
+
+    【処理概要】
+    - 条件に合う貸出申請（備品・申請者の情報を含む）の一覧・総件数を取得する。
+    - 自分の申請一覧取得（申請者を指定）と承認待ち申請一覧取得（申請者を指定しない）から利用される。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - requester_id (int | None) : 申請者内部ID（省略時は申請者で絞り込まない）
+    - status (str | None) : 状態（申請状態の列挙値。省略時は絞り込まない）
+    - newest_first (bool) : 新しい順要否（Trueは申請日時の降順、Falseは昇順）
+    - page (int) : ページ番号（1以上）
+    - page_size (int) : 1ページの件数（1〜100）
+
+    【戻り値】
+    - rows_and_total (tuple[list[tuple[LoanRequest, Equipment, User]], int]) : （明細一覧, 総件数）。該当なしは空リスト
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 条件に合う貸出申請の総件数を取得
+    2. 貸出申請・備品・申請者を結合し、申請日時と内部IDの順でページ単位に取得
+    3. 戻り値を設定
+    """
+    # 1. 総件数取得
+    conditions = []
+    if requester_id is not None:
+        conditions.append(LoanRequest.requester_id == requester_id)
+    if status is not None:
+        conditions.append(LoanRequest.status == status)
+    count_statement = select(func.count(LoanRequest.id)).where(*conditions)
+    total = db.execute(count_statement).scalar_one()
+
+    # 2. 一覧取得（同時刻でも順序が安定するよう内部IDを併用する）
+    if newest_first:
+        order_columns = (LoanRequest.requested_at.desc(), LoanRequest.id.desc())
+    else:
+        order_columns = (LoanRequest.requested_at.asc(), LoanRequest.id.asc())
+    offset = (page - 1) * page_size
+    list_statement = (
+        select(LoanRequest, Equipment, User)
+        .join(Equipment, Equipment.id == LoanRequest.equipment_id)
+        .join(User, User.id == LoanRequest.requester_id)
+        .where(*conditions)
+        .order_by(*order_columns)
+        .limit(page_size)
+        .offset(offset)
+    )
+    result_rows = db.execute(list_statement).all()
+    rows: list[tuple[LoanRequest, Equipment, User]] = [(row[0], row[1], row[2]) for row in result_rows]
+
+    # 3. 戻り値を設定
+    rows_and_total = (rows, total)
+    return rows_and_total
+
+
+def create_loan_request(
+    db: Session,
+    equipment_id: int,
+    requester_id: int,
+    start_date: date,
+    due_date: date,
+    purpose: str,
+    now: datetime,
+) -> LoanRequest:
+    """
+    貸出申請作成
+
+    設計書：設計書/CRUD/貸出申請・承認/貸出申請作成
+
+    【処理概要】
+    - 貸出申請を「申請中」で新規登録する（flushして内部IDを確定する。コミットは呼び出し元）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - equipment_id (int) : 備品内部ID（1以上）
+    - requester_id (int) : 申請者内部ID（認証済みユーザーの内部ID）
+    - start_date (date) : 開始日（JSTの暦日）
+    - due_date (date) : 返却予定日（開始日以降。呼び出し元で検証済み）
+    - purpose (str) : 用途（1〜200桁）
+    - now (datetime) : 現在日時（UTC。申請日時に設定する）
+
+    【戻り値】
+    - loan_request (LoanRequest) : 作成した貸出申請
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. loan_requestテーブルへ、状態を申請中・理由とメモを空文字として1件追加し、flushする
+    2. 戻り値を設定
+    """
+    # 1. 貸出申請レコードの作成
+    loan_request = LoanRequest(
+        equipment_id=equipment_id,
+        requester_id=requester_id,
+        start_date=start_date,
+        due_date=due_date,
+        purpose=purpose,
+        status=LoanStatus.REQUESTED.value,
+        reason="",
+        return_note="",
+        requested_at=now,
+    )
+    db.add(loan_request)
+    db.flush()
+
+    # 2. 戻り値を設定
+    return loan_request
+
+
+def get_loan_request_by_id(db: Session, loan_request_id: int, for_update: bool = False) -> LoanRequest | None:
+    """
+    貸出申請内部ID指定取得
+
+    設計書：設計書/CRUD/貸出申請・承認/貸出申請内部ID指定取得
+
+    【処理概要】
+    - 内部IDを指定して貸出申請を1件取得する（状態・申請者では絞り込まない）。
+    - 申請取消・承認・却下・管理者取消の各処理から利用される。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - loan_request_id (int) : 貸出申請内部ID（1以上）
+    - for_update (bool) : 行ロック要否（Trueの場合はFOR UPDATEで行ロックし最新の状態を返す。省略時False）
+
+    【戻り値】
+    - loan_request (LoanRequest | None) : 貸出申請情報（該当なしはNone）
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. loan_requestテーブルから内部IDが一致するレコードを取得
+    2. 戻り値を設定
+    """
+    # 1. 貸出申請取得
+    statement = select(LoanRequest).where(LoanRequest.id == loan_request_id)
+    if for_update:
+        # 再取得時に最新値を読むため、populate_existingで既存の読み込み済み値も更新する
+        statement = statement.with_for_update().execution_options(populate_existing=True)
+    loan_request = db.execute(statement).scalar_one_or_none()
+
+    # 2. 戻り値を設定
+    return loan_request
+
+
+def cancel_loan_request(
+    db: Session,
+    loan_request: LoanRequest,
+    canceled_by: int,
+    reason: str,
+    now: datetime,
+) -> LoanRequest:
+    """
+    貸出申請取消
+
+    設計書：設計書/CRUD/貸出申請・承認/貸出申請取消
+
+    【処理概要】
+    - 貸出申請を取消へ更新する（flushのみ。コミットは呼び出し元）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - loan_request (LoanRequest) : 貸出申請情報（行ロック取得済み・取消可能な状態であることを呼び出し元で検証済み）
+    - canceled_by (int) : 取消した者内部ID（申請者本人または管理者）
+    - reason (str) : 理由（管理者取消時は1文字以上。申請者本人の取消は空文字）
+    - now (datetime) : 現在日時（UTC）
+
+    【戻り値】
+    - loan_request (LoanRequest) : 更新した貸出申請
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. 状態を取消、取消した者・取消日時・理由を設定して、flushする
+    2. 戻り値を設定
+    """
+    # 1. 貸出申請の更新
+    loan_request.status = LoanStatus.CANCELED.value
+    loan_request.canceled_by = canceled_by
+    loan_request.canceled_at = now
+    loan_request.reason = reason
+    db.flush()
+
+    # 2. 戻り値を設定
+    return loan_request
+
+
+def decide_loan_request(
+    db: Session,
+    loan_request: LoanRequest,
+    new_status: str,
+    decided_by: int,
+    reason: str,
+    now: datetime,
+) -> LoanRequest:
+    """
+    貸出申請承認却下
+
+    設計書：設計書/CRUD/貸出申請・承認/貸出申請承認却下
+
+    【処理概要】
+    - 申請中の貸出申請を、承認済みまたは却下へ更新する（flushのみ。コミットは呼び出し元）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - loan_request (LoanRequest) : 貸出申請情報（行ロック取得済み・申請中であることを呼び出し元で検証済み）
+    - new_status (str) : 新しい状態（approvedまたはrejected）
+    - decided_by (int) : 処理した管理者内部ID
+    - reason (str) : 理由（却下時は1文字以上。承認時は空文字）
+    - now (datetime) : 現在日時（UTC）
+
+    【戻り値】
+    - loan_request (LoanRequest) : 更新した貸出申請
+
+    【例外処理】
+    - IntegrityError : 承認済みへの更新時、排他制約（ex_loan_request_equipment_period）に違反した場合
+      （呼び出し元が409へ変換する）
+
+    【処理フロー】
+    1. 状態・処理した管理者・承認却下日時・理由を設定して、flushする
+    2. 戻り値を設定
+    """
+    # 1. 貸出申請の更新
+    loan_request.status = new_status
+    loan_request.decided_by = decided_by
+    loan_request.decided_at = now
+    loan_request.reason = reason
+    db.flush()
+
+    # 2. 戻り値を設定
+    return loan_request
+
+
+def get_loan_request_detail(db: Session, loan_request_id: int) -> tuple[LoanRequest, Equipment, User] | None:
+    """
+    貸出申請詳細取得
+
+    設計書：設計書/CRUD/貸出申請・承認/貸出申請詳細取得
+
+    【処理概要】
+    - 内部IDを指定して、貸出申請と、その備品・申請者の情報を1件取得する（レスポンス生成用）。
+    - 備品・ユーザーは有効・無効を問わない（履歴として無効化済みの氏名・備品名を表示するため）。
+
+    【パラメータ】
+    - db (Session) : DBセッション
+    - loan_request_id (int) : 貸出申請内部ID（1以上）
+
+    【戻り値】
+    - detail (tuple[LoanRequest, Equipment, User] | None) : （貸出申請, 備品, 申請者）。該当なしはNone
+
+    【例外処理】
+    - なし
+
+    【処理フロー】
+    1. loan_request・equipment・app_userを結合して取得
+    2. 戻り値を設定
+    """
+    # 1. 貸出申請詳細取得
+    statement = (
+        select(LoanRequest, Equipment, User)
+        .join(Equipment, Equipment.id == LoanRequest.equipment_id)
+        .join(User, User.id == LoanRequest.requester_id)
+        .where(LoanRequest.id == loan_request_id)
+    )
+    row = db.execute(statement).first()
+
+    # 2. 戻り値を設定
+    if row is None:
+        return None
+    detail = (row[0], row[1], row[2])
+    return detail
