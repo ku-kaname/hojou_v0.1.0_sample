@@ -52,9 +52,9 @@ describe('申請管理画面', () => {
   })
 
   /** 却下APIの呼び出し回数を数える */
-  function countRejectCalls(fetchMock: ReturnType<typeof vi.spyOn>): number {
-    const calls = fetchMock.mock.calls.filter((call) => String(call[0]).includes('/reject'))
-    return calls.length
+  function countRejectCalls(calls: unknown[][]): number {
+    const rejectCalls = calls.filter((call) => String(call[0]).includes('/reject'))
+    return rejectCalls.length
   }
 
   /** 却下できる状態（承認待ち1件）の一覧を表示する偽物の通信を用意して、画面を表示する */
@@ -79,7 +79,7 @@ describe('申請管理画面', () => {
     await userEvent.click(await screen.findByRole('button', { name: '却下' }))
     await userEvent.click(screen.getByRole('button', { name: '却下する' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('却下理由を入力してください')
-    expect(countRejectCalls(fetchMock)).toBe(0)
+    expect(countRejectCalls(fetchMock.mock.calls)).toBe(0)
   })
 
   it('項番9：却下理由を入力して「却下する」を押すと、却下APIを1回呼んで完了メッセージを表示する', async () => {
@@ -88,7 +88,7 @@ describe('申請管理画面', () => {
     await userEvent.type(screen.getByLabelText(/却下理由/), '在庫なし')
     await userEvent.click(screen.getByRole('button', { name: '却下する' }))
     await waitFor(() => {
-      expect(countRejectCalls(fetchMock)).toBe(1)
+      expect(countRejectCalls(fetchMock.mock.calls)).toBe(1)
     })
     expect(await screen.findByRole('status')).toHaveTextContent('申請を却下しました')
   })

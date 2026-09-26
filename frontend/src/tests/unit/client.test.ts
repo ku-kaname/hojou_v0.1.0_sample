@@ -23,9 +23,9 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 /** 偽物のfetchが最後に受け取ったリクエストのヘッダーを取り出す */
-function lastRequestHeaders(fetchMock: ReturnType<typeof vi.spyOn>): Record<string, string> {
-  const calls = fetchMock.mock.calls
-  const init = calls[calls.length - 1][1] as RequestInit
+function lastRequestHeaders(calls: unknown[][]): Record<string, string> {
+  const lastCall = calls[calls.length - 1] ?? []
+  const init = lastCall[1] as RequestInit
   return init.headers as Record<string, string>
 }
 
@@ -53,19 +53,23 @@ describe('API呼び出し共通処理', () => {
 
   it('項番26：トークンがあれば、Authorizationヘッダーに「Bearer トークン」を付ける', async () => {
     setToken('test-token')
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ ok: true }))
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(() => Promise.resolve(jsonResponse({ ok: true })))
     await apiGet('/equipments')
-    expect(lastRequestHeaders(fetchMock)['Authorization']).toBe('Bearer test-token')
+    expect(lastRequestHeaders(fetchMock.mock.calls)['Authorization']).toBe('Bearer test-token')
   })
 
   it('項番27：トークンが無い場合と、認証不要（ログインなど）の呼び出しでは、ヘッダーを付けない', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ ok: true }))
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(() => Promise.resolve(jsonResponse({ ok: true })))
     await apiGet('/equipments')
-    expect(lastRequestHeaders(fetchMock)['Authorization']).toBeUndefined()
+    expect(lastRequestHeaders(fetchMock.mock.calls)['Authorization']).toBeUndefined()
 
     setToken('test-token')
     await apiPost('/auth/login', { login_id: 'a' }, true)
-    expect(lastRequestHeaders(fetchMock)['Authorization']).toBeUndefined()
+    expect(lastRequestHeaders(fetchMock.mock.calls)['Authorization']).toBeUndefined()
   })
 
   it('項番28：ステータス204（本文なし）はundefinedを返す', async () => {
@@ -119,7 +123,9 @@ describe('API呼び出し共通処理', () => {
   it('項番34：401を受け取ったら、認証ありの呼び出しではトークンを破棄して通知する。認証不要では何もしない', async () => {
     const handler = vi.fn()
     setUnauthorizedHandler(handler)
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ detail: '認証が必要です' }, 401))
+    vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+      Promise.resolve(jsonResponse({ detail: '認証が必要です' }, 401)),
+    )
 
     // 認証不要（ログイン失敗など）：トークンは残り、通知もされない
     setToken('test-token')
